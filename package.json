@@ -1,0 +1,10 @@
+{
+  "name": "@localitas/client",
+  "version": "0.1.0",
+  "description": "Node.js SDK for the Localitas platform API",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "license": "MIT"
+}
