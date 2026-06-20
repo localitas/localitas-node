@@ -188,4 +188,28 @@ function esc(s) {
   return encodeURIComponent(String(s));
 }
 
-module.exports = { LocalitasClient, APIError };
+/**
+ * Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
+ * Returns empty string if not found.
+ */
+function defaultToken() {
+  const fs = require('fs');
+  const path = require('path');
+  const home = require('os').homedir();
+  const configPath = path.join(home, '.localitas', 'config-core.yaml');
+
+  try {
+    const content = fs.readFileSync(configPath, 'utf8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('api_token:')) {
+        const val = trimmed.slice('api_token:'.length).trim().replace(/^["']|["']$/g, '');
+        if (val.startsWith('lt_')) return val;
+      }
+    }
+  } catch (_) {}
+
+  return '';
+}
+
+module.exports = { LocalitasClient, APIError, defaultToken };
