@@ -156,6 +156,32 @@ class LocalitasClient {
     return this._do('GET', `/apps/vault/api/credentials/${esc(publicId)}/secrets`);
   }
 
+  // ── Cache ──────────────────────────────────────────────────
+
+  /** Create a named in-memory cache. */
+  async createCache(name) {
+    return this._do('POST', '/apps/cache/api/caches', { name });
+  }
+
+  /** List all named caches. */
+  async listCaches() {
+    return this._do('GET', '/apps/cache/api/caches');
+  }
+
+  /** Delete a named cache. Cannot delete 'public_paths'. */
+  async deleteCache(name) {
+    return this._do('DELETE', `/apps/cache/api/caches/${esc(name)}`);
+  }
+
+  /**
+   * Return a CacheRef for key-value and data structure operations.
+   * @param {string} name - Cache name.
+   * @returns {CacheRef}
+   */
+  cache(name) {
+    return new CacheRef(this, name);
+  }
+
   // ── Transport ──────────────────────────────────────────────
 
   async _do(method, path, body = null) {
@@ -212,4 +238,197 @@ function defaultToken() {
   return '';
 }
 
-module.exports = { LocalitasClient, APIError, defaultToken };
+/**
+ * Reference to a named cache. Provides Redis-like key-value operations
+ * and typed data structure accessors.
+ *
+ * @example
+ *   const cache = client.cache('sessions');
+ *   await cache.set('user:abc', '{"name":"Alice"}', 1800);
+ *   const val = await cache.get('user:abc');
+ */
+class CacheRef {
+  constructor(client, name) {
+    this._client = client;
+    this._name = name;
+    this._base = `/apps/cache/api/caches/${esc(name)}`;
+  }
+
+  // ── KV ─────────────────────────────────────────────────────
+
+  /** Get a key's value. Returns null on miss. */
+  async get(key) {
+    try {
+      const r = await this._client._do('GET', `${this._base}/keys/${key}`);
+      return r?.result?.value ?? null;
+    } catch (e) {
+      if (e.statusCode === 404) return null;
+      throw e;
+    }
+  }
+
+  /** Set a key with optional TTL in seconds. */
+  async set(key, value, ttl = 0) {
+    return this._client._do('PUT', `${this._base}/keys/${key}`, { value, ttl });
+  }
+
+  /** Delete a key. */
+  async del(key) {
+    return this._client._do('DELETE', `${this._base}/keys/${key}`);
+  }
+
+  /** Atomically increment. Creates with delta if missing. */
+  async incr(key, delta = 1) {
+    const r = await this._client._do('POST', `${this._base}/incr/${key}`, { delta });
+    return r?.result?.value ?? 0;
+  }
+
+  /** Atomic increment + set TTL only on first call. For rate limiting. */
+  async incrWithTTL(key, delta = 1, ttl = 60) {
+    const r = await this._client._do('POST', `${this._base}/incrttl/${key}`, { delta, ttl });
+    return r?.result?.value ?? 0;
+  }
+
+  /** Set only if key doesn't exist. Returns true if set. For distributed locks. */
+  async setNX(key, value, ttl = 0) {
+    const r = await this._client._do('POST', `${this._base}/setnx/${key}`, { value, ttl });
+    return r?.result?.acquired ?? false;
+  }
+
+  /** List keys matching glob pattern. */
+  async keys(pattern = '*') {
+    const r = await this._client._do('GET', `${this._base}/keys?pattern=${esc(pattern)}`);
+    return r?.result?.keys ?? [];
+  }
+
+  /** Flush all data in this cache. */
+  async flush() {
+    return this._client._do('POST', `${this._base}/flush`);
+  }
+
+  /** Get cache stats. */
+  async stats() {
+    const r = await this._client._do('GET', `${this._base}/stats`);
+    return r?.result ?? {};
+  }
+
+  // ── Data structure accessors ────────────────────────────────
+
+  /** @returns {ListRef} */
+  list(name) { return new ListRef(this, name); }
+  /** @returns {SetRef} */
+  setStore(name) { return new SetRef(this, name); }
+  /** @returns {HashRef} */
+  hash(name) { return new HashRef(this, name); }
+  /** @returns {SortedSetRef} */
+  sortedSet(name) { return new SortedSetRef(this, name); }
+  /** @returns {QueueRef} */
+  queue(name, maxSize = 0) { return new QueueRef(this, name, maxSize); }
+  /** @returns {StackRef} */
+  stack(name, maxSize = 0) { return new StackRef(this, name, maxSize); }
+  /** @returns {PubSubRef} */
+  pubSub(channel, opts = {}) { return new PubSubRef(this, channel, opts); }
+}
+
+/** Double-headed deque. */
+class ListRef {
+  constructor(cache, name) {
+    this._c = cache._client;
+    this._base = `${cache._base}/list/${esc(name)}`;
+  }
+  async lpush(...values) { return (await this._c._do('POST', `${this._base}/lpush`, { values }))?.result?.length ?? 0; }
+  async rpush(...values) { return (await this._c._do('POST', `${this._base}/rpush`, { values }))?.result?.length ?? 0; }
+  async lpop() { try { return (await this._c._do('POST', `${this._base}/lpop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async rpop() { try { return (await this._c._do('POST', `${this._base}/rpop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async range(start = 0, stop = -1) { return (await this._c._do('GET', `${this._base}?start=${start}&stop=${stop}`))?.result?.values ?? []; }
+  async del() { return this._c._do('DELETE', this._base); }
+}
+
+/** Unique unordered set. */
+class SetRef {
+  constructor(cache, name) {
+    this._c = cache._client;
+    this._base = `${cache._base}/set/${esc(name)}`;
+  }
+  async add(...members) { return (await this._c._do('POST', `${this._base}/add`, { members }))?.result?.added ?? 0; }
+  async rem(...members) { return (await this._c._do('POST', `${this._base}/rem`, { members }))?.result?.removed ?? 0; }
+  async members() { return (await this._c._do('GET', this._base))?.result?.members ?? []; }
+  async del() { return this._c._do('DELETE', this._base); }
+}
+
+/** Field→value map. */
+class HashRef {
+  constructor(cache, name) {
+    this._c = cache._client;
+    this._base = `${cache._base}/hash/${esc(name)}`;
+  }
+  async set(fields) { return this._c._do('PUT', this._base, { fields }); }
+  async get(field) { try { return (await this._c._do('GET', `${this._base}/field/${esc(field)}`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async getAll() { return (await this._c._do('GET', this._base))?.result?.fields ?? {}; }
+  async toJSON() { return (await this._c._do('GET', `${this._base}/json`))?.result?.json ?? '{}'; }
+  async fromJSON(jsonStr) { return this._c._do('PUT', `${this._base}/json`, { json: jsonStr }); }
+  async del() { return this._c._do('DELETE', this._base); }
+}
+
+/** Members ordered by score. */
+class SortedSetRef {
+  constructor(cache, name) {
+    this._c = cache._client;
+    this._base = `${cache._base}/zset/${esc(name)}`;
+  }
+  async add(...entries) { return (await this._c._do('POST', `${this._base}/add`, { entries: entries.map(([m,s]) => ({member:m,score:s})) }))?.result?.added ?? 0; }
+  async score(member) { try { return (await this._c._do('GET', `${this._base}/score/${esc(member)}`))?.result?.score; } catch(e) { return null; } }
+  async rank(member) { try { return (await this._c._do('GET', `${this._base}/rank/${esc(member)}`))?.result?.rank ?? -1; } catch(e) { return -1; } }
+  async range(start = 0, stop = -1) { return (await this._c._do('GET', `${this._base}?start=${start}&stop=${stop}`))?.result?.entries ?? []; }
+  async rem(...members) { return (await this._c._do('POST', `${this._base}/rem`, { members }))?.result?.removed ?? 0; }
+  async incrBy(member, delta) { return (await this._c._do('POST', `${this._base}/incrby`, { member, delta }))?.result?.score ?? 0; }
+  async del() { return this._c._do('DELETE', this._base); }
+}
+
+/** FIFO queue. Bounded queues drop oldest on overflow. */
+class QueueRef {
+  constructor(cache, name, maxSize) {
+    this._c = cache._client;
+    this._maxSize = maxSize;
+    this._base = `${cache._base}/queue/${esc(name)}`;
+  }
+  async enqueue(value) { return (await this._c._do('POST', `${this._base}/enqueue`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
+  async dequeue() { try { return (await this._c._do('POST', `${this._base}/dequeue`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async peek() { try { return (await this._c._do('GET', this._base))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+}
+
+/** LIFO stack. Bounded stacks drop bottom on overflow. */
+class StackRef {
+  constructor(cache, name, maxSize) {
+    this._c = cache._client;
+    this._maxSize = maxSize;
+    this._base = `${cache._base}/stack/${esc(name)}`;
+  }
+  async push(value) { return (await this._c._do('POST', `${this._base}/push`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
+  async pop() { try { return (await this._c._do('POST', `${this._base}/pop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async peek() { try { return (await this._c._do('GET', this._base))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+}
+
+/** Durable pub/sub channel with broadcast and consumer groups. */
+class PubSubRef {
+  constructor(cache, channel, opts) {
+    this._c = cache._client;
+    this._channel = channel;
+    this._maxSize = opts.maxSize || 0;
+    this._maxAgeSeconds = opts.maxAgeSeconds || 0;
+    this._base = `${cache._base}/pubsub/${esc(channel)}`;
+  }
+  async publish(value) {
+    const body = { value };
+    if (this._maxSize > 0) body.max_size = this._maxSize;
+    if (this._maxAgeSeconds > 0) body.max_age_seconds = this._maxAgeSeconds;
+    return (await this._c._do('POST', `${this._base}/publish`, body))?.result?.seq ?? 0;
+  }
+  async read(consumerId, count = 50) { return (await this._c._do('GET', `${this._base}/read?consumer=${esc(consumerId)}&count=${count}`))?.result?.messages ?? []; }
+  async createGroup(groupName) { return this._c._do('POST', `${this._base}/group/${esc(groupName)}`); }
+  async claim(groupName, consumerId) { return (await this._c._do('POST', `${this._base}/group/${esc(groupName)}/claim?consumer=${esc(consumerId)}`))?.result?.message; }
+  async ack(groupName, seq) { return this._c._do('POST', `${this._base}/group/${esc(groupName)}/ack`, { seq }); }
+  async del() { return this._c._do('DELETE', this._base); }
+}
+
+module.exports = { LocalitasClient, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, APIError, defaultToken };
