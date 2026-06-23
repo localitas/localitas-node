@@ -244,8 +244,37 @@ function defaultToken() {
  *
  * @example
  *   const cache = client.cache('sessions');
+ *
+ *   // KV with TTL
  *   await cache.set('user:abc', '{"name":"Alice"}', 1800);
  *   const val = await cache.get('user:abc');
+ *
+ *   // Rate limiting
+ *   const count = await cache.incrWithTTL('rate:ip:1.2.3.4', 1, 60);
+ *   if (count > 100) throw new Error('rate limited');
+ *
+ *   // Distributed lock
+ *   const acquired = await cache.setNX('lock:resource', 'owner-1', 30);
+ *
+ *   // Data structures
+ *   const list = cache.list('recent');
+ *   await list.rpush('a', 'b', 'c');
+ *
+ *   const tags = cache.setStore('tags');
+ *   await tags.add('go', 'rust');
+ *
+ *   const user = cache.hash('user:123');
+ *   await user.set({ name: 'Alice', email: 'alice@example.com' });
+ *
+ *   const lb = cache.sortedSet('leaderboard');
+ *   await lb.add(['alice', 1500], ['bob', 2100]);
+ *
+ *   const q = cache.queue('jobs', 1000);
+ *   await q.enqueue('{"type":"email"}');
+ *
+ *   const ch = cache.pubSub('notifications', { maxSize: 1000, maxAgeSeconds: 1209600 });
+ *   await ch.publish('{"type":"signup"}');
+ *   const msgs = await ch.read('audit-svc', 50);
  */
 class CacheRef {
   constructor(client, name) {
