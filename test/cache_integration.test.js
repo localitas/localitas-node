@@ -193,6 +193,94 @@ async function main() {
     await ch.ack('workers', msg.seq);
   }));
 
+  // WebSocket tests
+  let WebSocket;
+  try {
+    WebSocket = require('ws');
+  } catch (e) {
+    console.log('\n  SKIP: ws module not installed, skipping WebSocket tests');
+  }
+
+  if (WebSocket) {
+    await test('websocket subscribe and publish', () => withCache('ws', async (cache) => {
+      const name = cache._name;
+      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}?token=${INTEG_TOKEN}`;
+
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
+
+        let step = 0;
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString());
+
+          if (step === 0) {
+            assert.strictEqual(msg.type, 'connected');
+            ws.send(JSON.stringify({ action: 'subscribe', channel: 'ws-test', consumer: 'node-test' }));
+            step++;
+          } else if (step === 1) {
+            assert.strictEqual(msg.type, 'subscribed');
+            ws.send(JSON.stringify({ action: 'publish', channel: 'ws-test', value: '{"from":"node"}' }));
+            step++;
+          } else if (step === 2) {
+            assert.strictEqual(msg.type, 'published');
+            step++;
+          } else if (step === 3) {
+            assert.strictEqual(msg.type, 'message');
+            assert.strictEqual(msg.value, '{"from":"node"}');
+            clearTimeout(timeout);
+            ws.close();
+            resolve();
+          }
+        });
+      });
+    }));
+
+    await test('websocket two clients broadcast', () => withCache('ws2', async (cache) => {
+      const name = cache._name;
+      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}?token=${INTEG_TOKEN}`;
+
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => { reject(new Error('timeout')); }, 5000);
+        const ws1 = new WebSocket(wsUrl);
+        const ws2 = new WebSocket(wsUrl);
+        let ws1Ready = false, ws2Ready = false, ws2Received = false;
+
+        function bothReady() {
+          if (!ws1Ready || !ws2Ready) return;
+          ws1.send(JSON.stringify({ action: 'publish', channel: 'bcast', value: 'hello' }));
+        }
+
+        ws1.on('message', (data) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'connected') {
+            ws1.send(JSON.stringify({ action: 'subscribe', channel: 'bcast', consumer: 'c1' }));
+          } else if (msg.type === 'subscribed') {
+            ws1Ready = true;
+            bothReady();
+          }
+        });
+
+        ws2.on('message', (data) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'connected') {
+            ws2.send(JSON.stringify({ action: 'subscribe', channel: 'bcast', consumer: 'c2' }));
+          } else if (msg.type === 'subscribed') {
+            ws2Ready = true;
+            bothReady();
+          } else if (msg.type === 'message' && msg.value === 'hello') {
+            ws2Received = true;
+            clearTimeout(timeout);
+            ws1.close();
+            ws2.close();
+            assert.ok(ws2Received, 'ws2 received broadcast');
+            resolve();
+          }
+        });
+      });
+    }));
+  }
+
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }
