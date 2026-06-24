@@ -145,6 +145,39 @@ class LocalitasClient {
     return this._do('DELETE', path, { user_id: userId, group_id: groupId });
   }
 
+  async getResourceOwner(app, resourceType, resourceId) {
+    const path = `/api/permissions/${esc(app)}/${esc(resourceType)}/${esc(resourceId)}/owner`;
+    const result = await this._do('GET', path);
+    return result?.owner_id || '';
+  }
+
+  async deleteResourcePermissions(app, resourceType, resourceId) {
+    const path = `/api/permissions/${esc(app)}/${esc(resourceType)}/${esc(resourceId)}`;
+    return this._do('DELETE', path);
+  }
+
+  async listAccessibleResources(app, resourceType) {
+    const path = `/api/permissions/accessible?app=${esc(app)}&resource_type=${esc(resourceType)}`;
+    const result = await this._do('GET', path);
+    return result?.resources || [];
+  }
+
+  async getUserGroupIds(userId) {
+    const path = `/api/users/${esc(userId)}/groups`;
+    const result = await this._do('GET', path);
+    return result?.group_ids || [];
+  }
+
+  async listUsers() {
+    const result = await this._do('GET', '/api/users');
+    return result?.users || [];
+  }
+
+  async listGroups() {
+    const result = await this._do('GET', '/api/groups');
+    return result?.groups || [];
+  }
+
   // ── Vault ──────────────────────────────────────────────────
 
   async vaultListCredentials() {
