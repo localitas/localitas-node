@@ -460,4 +460,232 @@ class PubSubRef {
   async del() { return this._c._do('DELETE', this._base); }
 }
 
-module.exports = { LocalitasClient, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, APIError, defaultToken };
+const WebSocket = require('ws');
+
+/**
+ * WebSocket-based real-time pub/sub client for Localitas DurablePubSub.
+ *
+ * Provides automatic reconnection with exponential backoff, cursor-based
+ * message delivery (no missed messages), and consumer group support.
+ *
+ * @example
+ *   const { PubSubWS } = require('@localitas/client');
+ *   const pubsub = new PubSubWS({
+ *     url: 'ws://localhost:8080/apps/cache/ws/my-cache',
+ *     token: 'your-api-token',
+ *   });
+ *
+ *   pubsub.subscribe('notifications', 'worker-1', (msg) => {
+ *     console.log('Got:', msg.value);
+ *   });
+ *
+ *   pubsub.publish('events', '{"type":"click"}');
+ *   pubsub.on('connected', () => console.log('connected'));
+ */
+class PubSubWS {
+  /**
+   * Create a new PubSubWS client. Connects automatically.
+   *
+   * @param {Object} opts - Connection options.
+   * @param {string} opts.url - WebSocket URL (ws://host/apps/cache/ws/{cache}).
+   * @param {string} opts.token - Bearer token for authentication.
+   * @param {number} [opts.reconnectInterval=2000] - Base reconnect interval in ms.
+   * @param {number} [opts.maxReconnectInterval=30000] - Maximum reconnect interval cap in ms.
+   */
+  constructor(opts) {
+    this.url = opts.url;
+    this.token = opts.token || '';
+    this.reconnectInterval = opts.reconnectInterval || 2000;
+    this.maxReconnectInterval = opts.maxReconnectInterval || 30000;
+
+    /** @private */
+    this._ws = null;
+    /** @private */
+    this._subscriptions = {};
+    /** @private */
+    this._listeners = {};
+    /** @private */
+    this._reconnectAttempts = 0;
+    /** @private */
+    this._intentionalClose = false;
+
+    this._connect();
+  }
+
+  /**
+   * Subscribe to a channel. The callback fires for each incoming message.
+   * On reconnect, subscriptions are automatically re-established from the
+   * server's last cursor position so no messages are missed.
+   *
+   * @param {string} channel - Channel name to subscribe to.
+   * @param {string} consumer - Consumer ID for cursor tracking.
+   * @param {Function} callback - Called with { seq, value, channel } for each message.
+   */
+  subscribe(channel, consumer, callback) {
+    this._subscriptions[channel] = { consumer, callback };
+    if (this._isConnected()) {
+      this._send({ action: 'subscribe', channel, consumer });
+    }
+  }
+
+  /**
+   * Unsubscribe from a channel.
+   *
+   * @param {string} channel - Channel name to unsubscribe from.
+   */
+  unsubscribe(channel) {
+    delete this._subscriptions[channel];
+    if (this._isConnected()) {
+      this._send({ action: 'unsubscribe', channel });
+    }
+  }
+
+  /**
+   * Publish a message to a channel.
+   *
+   * @param {string} channel - Channel to publish to.
+   * @param {string} value - Message value (typically JSON string).
+   * @param {Object} [opts] - Publish options.
+   * @param {number} [opts.maxSize] - Bound channel by message count.
+   * @param {number} [opts.maxAgeSeconds] - Auto-expire messages older than this many seconds.
+   */
+  publish(channel, value, opts = {}) {
+    const msg = { action: 'publish', channel, value };
+    if (opts.maxSize) msg.max_size = opts.maxSize;
+    if (opts.maxAgeSeconds) msg.max_age_seconds = opts.maxAgeSeconds;
+    this._send(msg);
+  }
+
+  /**
+   * Acknowledge a consumer group message.
+   *
+   * @param {string} channel - Channel name.
+   * @param {string} group - Consumer group name.
+   * @param {number} seq - Sequence number to acknowledge.
+   */
+  ack(channel, group, seq) {
+    this._send({ action: 'ack', channel, group, seq });
+  }
+
+  /**
+   * Register an event listener.
+   *
+   * @param {string} event - Event name: 'connected', 'disconnected', 'error', 'reconnecting'.
+   * @param {Function} callback - Event handler.
+   */
+  on(event, callback) {
+    if (!this._listeners[event]) {
+      this._listeners[event] = [];
+    }
+    this._listeners[event].push(callback);
+  }
+
+  /**
+   * Remove an event listener.
+   *
+   * @param {string} event - Event name.
+   * @param {Function} callback - Handler to remove.
+   */
+  off(event, callback) {
+    if (this._listeners[event]) {
+      this._listeners[event] = this._listeners[event].filter(cb => cb !== callback);
+    }
+  }
+
+  /**
+   * Intentionally close the connection. Does not auto-reconnect.
+   */
+  close() {
+    this._intentionalClose = true;
+    if (this._ws) {
+      this._ws.close();
+      this._ws = null;
+    }
+  }
+
+  /** @private */
+  _connect() {
+    let url = this.url;
+    if (this.token) {
+      url += (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(this.token);
+    }
+
+    this._ws = new WebSocket(url);
+
+    this._ws.on('open', () => {
+      this._reconnectAttempts = 0;
+      this._emit('connected');
+
+      for (const channel in this._subscriptions) {
+        const sub = this._subscriptions[channel];
+        this._send({ action: 'subscribe', channel, consumer: sub.consumer });
+      }
+    });
+
+    this._ws.on('close', () => {
+      this._emit('disconnected');
+      if (!this._intentionalClose) {
+        this._reconnect();
+      }
+    });
+
+    this._ws.on('error', (err) => {
+      this._emit('error', err);
+    });
+
+    this._ws.on('message', (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch (_) {
+        return;
+      }
+      this._handleMessage(msg);
+    });
+  }
+
+  /** @private */
+  _handleMessage(msg) {
+    if (msg.type === 'message' && msg.channel) {
+      const sub = this._subscriptions[msg.channel];
+      if (sub && sub.callback) {
+        sub.callback({ seq: msg.seq, value: msg.value, channel: msg.channel });
+      }
+    }
+  }
+
+  /** @private */
+  _send(data) {
+    if (this._isConnected()) {
+      this._ws.send(JSON.stringify(data));
+    }
+  }
+
+  /** @private */
+  _isConnected() {
+    return this._ws && this._ws.readyState === WebSocket.OPEN;
+  }
+
+  /** @private */
+  _reconnect() {
+    this._reconnectAttempts++;
+    const delay = Math.min(
+      this.reconnectInterval * Math.pow(1.5, this._reconnectAttempts - 1),
+      this.maxReconnectInterval
+    );
+    if (delay >= this.maxReconnectInterval) {
+      this._reconnectAttempts = 0;
+    }
+    this._emit('reconnecting', { attempt: this._reconnectAttempts, delay });
+    setTimeout(() => this._connect(), delay);
+  }
+
+  /** @private */
+  _emit(event, data) {
+    if (this._listeners[event]) {
+      this._listeners[event].forEach(cb => cb(data));
+    }
+  }
+}
+
+module.exports = { LocalitasClient, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, APIError, defaultToken };

@@ -6,5 +6,8 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
