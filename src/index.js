@@ -688,4 +688,6 @@ class PubSubWS {
   }
 }
 
-module.exports = { LocalitasClient, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, APIError, defaultToken };
+const { Database } = require('./dbapi');
+
+module.exports = { LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, APIError, defaultToken };
