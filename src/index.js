@@ -341,19 +341,19 @@ class CacheRef {
 
   /** Atomically increment. Creates with delta if missing. */
   async incr(key, delta = 1) {
-    const r = await this._client._do('POST', `${this._base}/incr/${key}`, { delta });
+    const r = await this._client._do('POST', `${this._base}/keys/${key}/incr`, { delta });
     return r?.result?.value ?? 0;
   }
 
   /** Atomic increment + set TTL only on first call. For rate limiting. */
   async incrWithTTL(key, delta = 1, ttl = 60) {
-    const r = await this._client._do('POST', `${this._base}/incrttl/${key}`, { delta, ttl });
+    const r = await this._client._do('POST', `${this._base}/keys/${key}/incrttl`, { delta, ttl });
     return r?.result?.value ?? 0;
   }
 
   /** Set only if key doesn't exist. Returns true if set. For distributed locks. */
   async setNX(key, value, ttl = 0) {
-    const r = await this._client._do('POST', `${this._base}/setnx/${key}`, { value, ttl });
+    const r = await this._client._do('POST', `${this._base}/keys/${key}/setnx`, { value, ttl });
     return r?.result?.acquired ?? false;
   }
 
@@ -396,7 +396,7 @@ class CacheRef {
 class ListRef {
   constructor(cache, name) {
     this._c = cache._client;
-    this._base = `${cache._base}/list/${esc(name)}`;
+    this._base = `${cache._base}/lists/${esc(name)}`;
   }
   async lpush(...values) { return (await this._c._do('POST', `${this._base}/lpush`, { values }))?.result?.length ?? 0; }
   async rpush(...values) { return (await this._c._do('POST', `${this._base}/rpush`, { values }))?.result?.length ?? 0; }
@@ -410,7 +410,7 @@ class ListRef {
 class SetRef {
   constructor(cache, name) {
     this._c = cache._client;
-    this._base = `${cache._base}/set/${esc(name)}`;
+    this._base = `${cache._base}/sets/${esc(name)}`;
   }
   async add(...members) { return (await this._c._do('POST', `${this._base}/add`, { members }))?.result?.added ?? 0; }
   async rem(...members) { return (await this._c._do('POST', `${this._base}/rem`, { members }))?.result?.removed ?? 0; }
@@ -422,10 +422,10 @@ class SetRef {
 class HashRef {
   constructor(cache, name) {
     this._c = cache._client;
-    this._base = `${cache._base}/hash/${esc(name)}`;
+    this._base = `${cache._base}/hashes/${esc(name)}`;
   }
   async set(fields) { return this._c._do('PUT', this._base, { fields }); }
-  async get(field) { try { return (await this._c._do('GET', `${this._base}/field/${esc(field)}`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async get(field) { try { return (await this._c._do('GET', `${this._base}/fields/${esc(field)}`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
   async getAll() { return (await this._c._do('GET', this._base))?.result?.fields ?? {}; }
   async toJSON() { return (await this._c._do('GET', `${this._base}/json`))?.result?.json ?? '{}'; }
   async fromJSON(jsonStr) { return this._c._do('PUT', `${this._base}/json`, { json: jsonStr }); }
@@ -436,7 +436,7 @@ class HashRef {
 class SortedSetRef {
   constructor(cache, name) {
     this._c = cache._client;
-    this._base = `${cache._base}/zset/${esc(name)}`;
+    this._base = `${cache._base}/zsets/${esc(name)}`;
   }
   async add(...entries) { return (await this._c._do('POST', `${this._base}/add`, { entries: entries.map(([m,s]) => ({member:m,score:s})) }))?.result?.added ?? 0; }
   async score(member) { try { return (await this._c._do('GET', `${this._base}/score/${esc(member)}`))?.result?.score; } catch(e) { return null; } }
@@ -452,7 +452,7 @@ class QueueRef {
   constructor(cache, name, maxSize) {
     this._c = cache._client;
     this._maxSize = maxSize;
-    this._base = `${cache._base}/queue/${esc(name)}`;
+    this._base = `${cache._base}/queues/${esc(name)}`;
   }
   async enqueue(value) { return (await this._c._do('POST', `${this._base}/enqueue`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
   async dequeue() { try { return (await this._c._do('POST', `${this._base}/dequeue`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
@@ -464,7 +464,7 @@ class StackRef {
   constructor(cache, name, maxSize) {
     this._c = cache._client;
     this._maxSize = maxSize;
-    this._base = `${cache._base}/stack/${esc(name)}`;
+    this._base = `${cache._base}/stacks/${esc(name)}`;
   }
   async push(value) { return (await this._c._do('POST', `${this._base}/push`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
   async pop() { try { return (await this._c._do('POST', `${this._base}/pop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
