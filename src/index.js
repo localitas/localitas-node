@@ -341,19 +341,19 @@ class CacheRef {
 
   /** Atomically increment. Creates with delta if missing. */
   async incr(key, delta = 1) {
-    const r = await this._client._do('POST', `${this._base}/keys/${key}/incr`, { delta });
+    const r = await this._client._do('POST', `${this._base}/keys/incr/${key}`, { delta });
     return r?.result?.value ?? 0;
   }
 
   /** Atomic increment + set TTL only on first call. For rate limiting. */
   async incrWithTTL(key, delta = 1, ttl = 60) {
-    const r = await this._client._do('POST', `${this._base}/keys/${key}/incrttl`, { delta, ttl });
+    const r = await this._client._do('POST', `${this._base}/keys/incrttl/${key}`, { delta, ttl });
     return r?.result?.value ?? 0;
   }
 
   /** Set only if key doesn't exist. Returns true if set. For distributed locks. */
   async setNX(key, value, ttl = 0) {
-    const r = await this._client._do('POST', `${this._base}/keys/${key}/setnx`, { value, ttl });
+    const r = await this._client._do('POST', `${this._base}/keys/setnx/${key}`, { value, ttl });
     return r?.result?.acquired ?? false;
   }
 
