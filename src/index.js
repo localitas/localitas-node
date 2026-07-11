@@ -215,6 +215,11 @@ class LocalitasClient {
     return new CacheRef(this, name);
   }
 
+  /** Return an AutomationClient for run management and async job signaling. */
+  automation() {
+    return new AutomationClient(this);
+  }
+
   // ── Transport ──────────────────────────────────────────────
 
   async _do(method, path, body = null) {
@@ -515,6 +520,40 @@ const WebSocket = require('ws');
  *   pubsub.publish('events', '{"type":"click"}');
  *   pubsub.on('connected', () => console.log('connected'));
  */
+class AutomationClient {
+  constructor(client) {
+    this._client = client;
+  }
+
+  /** Trigger an automation and return the run. */
+  async trigger(automationId) {
+    return this._client._do('POST', `/apps/automation/api/automations/${automationId}/trigger`);
+  }
+
+  /** Get a run by ID. */
+  async getRun(runId) {
+    return this._client._do('GET', `/apps/automation/api/runs/${runId}`);
+  }
+
+  /** Signal async job completion. Called from inside the background job. */
+  async publishResult(runId, status = 'completed', result = {}, error = '') {
+    return this._client._do('POST', `/apps/automation/api/runs/${runId}/complete`, { status, result, error });
+  }
+
+  /** Wait for a run to complete by polling. Returns the completed run. */
+  async waitForRun(runId, { timeout = 3600000, pollInterval = 2000 } = {}) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const run = await this.getRun(runId);
+      if (run.status !== 'running' && run.status !== 'pending') {
+        return run;
+      }
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+    throw new Error(`Timeout waiting for run ${runId}`);
+  }
+}
+
 class PubSubWS {
   /**
    * Create a new PubSubWS client. Connects automatically.
@@ -723,4 +762,4 @@ class PubSubWS {
 
 const { Database } = require('./dbapi');
 
-module.exports = { LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, APIError, defaultToken };
+module.exports = { LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, defaultToken };
