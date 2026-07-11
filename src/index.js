@@ -540,17 +540,31 @@ class AutomationClient {
     return this._client._do('POST', `/apps/automation/api/runs/${runId}/complete`, { status, result, error });
   }
 
-  /** Wait for a run to complete by polling. Returns the completed run. */
-  async waitForRun(runId, { timeout = 3600000, pollInterval = 2000 } = {}) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const run = await this.getRun(runId);
-      if (run.status !== 'running' && run.status !== 'pending') {
-        return run;
-      }
-      await new Promise(r => setTimeout(r, pollInterval));
-    }
-    throw new Error(`Timeout waiting for run ${runId}`);
+  /** Wait for a run to complete via WebSocket pubsub. Returns the completed run. */
+  async waitForRun(runId, { timeout = 3600000 } = {}) {
+    const baseUrl = this._client.baseURL || '';
+    const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://') + '/apps/cache/ws/localitas_automations';
+    const consumerId = `sdk-wait-${runId}-${Date.now()}`;
+
+    return new Promise((resolve, reject) => {
+      const ps = new PubSubWS({ url: wsUrl, token: this._client.token });
+      const timer = setTimeout(() => {
+        ps.close();
+        reject(new Error(`Timeout waiting for run ${runId}`));
+      }, timeout);
+
+      ps.subscribe('completions', consumerId, async (msg) => {
+        try {
+          const payload = JSON.parse(msg.value || '{}');
+          if (payload.run_id === runId) {
+            clearTimeout(timer);
+            const run = await this.getRun(runId);
+            ps.close();
+            resolve(run);
+          }
+        } catch (e) {}
+      });
+    });
   }
 }
 
