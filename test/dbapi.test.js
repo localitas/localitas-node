@@ -32,7 +32,7 @@ const routes = {
     if (body.statements) {
       return [200, { rows_affected: body.statements.length }];
     }
-    return [200, { rows_affected: 1, last_insert_rowid: 42 }];
+    return [200, { rows_affected: 1, last_insert_id: 42 }];
   },
 };
 

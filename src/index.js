@@ -8,6 +8,10 @@
  *   const databases = await authed.listDatabases();
  */
 
+// Header the platform sets on automation-triggered HTTP calls; carries the run
+// ID a handler publishes its async result back to (see AutomationClient.runAsync).
+const AUTOMATION_RUN_ID_HEADER = 'Localitas-Automation-Run-ID';
+
 class APIError extends Error {
   constructor(method, path, statusCode, body) {
     super(`${method} ${path}: ${statusCode} ${body}`);
@@ -114,6 +118,46 @@ class LocalitasClient {
     return this._do('POST', '/apps/data/api/search/hybrid', body);
   }
 
+  // ── Service Registry ───────────────────────────────────────
+
+  async _serviceRegistryDb() {
+    const db = await this.createDatabase('service_registry', true);
+    await this.applyMigration(db.id, '20260424-000000-000-init', 'service registry table',
+      'CREATE TABLE IF NOT EXISTS services (name TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)',
+      'DROP TABLE IF EXISTS services');
+    return db.id;
+  }
+
+  /** Register a named service URL in the shared service registry. */
+  async registerService(name, url) {
+    const dbId = await this._serviceRegistryDb();
+    await this.sqlExec(dbId,
+      'INSERT INTO services (name, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at',
+      name, url, Math.floor(Date.now() / 1000));
+  }
+
+  /** Look up a service URL by name. Throws if not found. */
+  async discoverService(name) {
+    const dbId = await this._serviceRegistryDb();
+    const result = await this.sqlQuery(dbId, 'SELECT url FROM services WHERE name = ?', name);
+    if (!result?.rows?.length) {
+      throw new APIError('GET', `/services/${name}`, 404, `service ${name} not found`);
+    }
+    return result.rows[0][0];
+  }
+
+  /** List all registered services as [{ name, url }]. */
+  async listServices() {
+    const dbId = await this._serviceRegistryDb();
+    const result = await this.sqlQuery(dbId, 'SELECT name, url, updated_at FROM services ORDER BY name');
+    return (result?.rows || []).map((r) => ({ name: r[0], url: r[1] }));
+  }
+
+  /** Register this app into the platform app registry (app selector UI). */
+  async registerExternalApp(name, displayName, url, icon = '') {
+    return this._do('POST', '/apps/ext', { name, display_name: displayName, url, icon });
+  }
+
   // ── Permissions ────────────────────────────────────────────
 
   async setResourceOwner(app, resourceType, resourceId, ownerId) {
@@ -187,6 +231,49 @@ class LocalitasClient {
 
   async vaultGetSecrets(publicId) {
     return this._do('GET', `/apps/vault/api/credentials/${esc(publicId)}/secrets`);
+  }
+
+  async vaultCreateCredential(name, { url = '', keychainSync = false, data = {} } = {}) {
+    return this._do('POST', '/apps/vault/api/credentials', {
+      name, url, keychain_sync: keychainSync, data,
+    });
+  }
+
+  async vaultUpdateCredential(publicId, name, { url = '', keychainSync = false, data = {} } = {}) {
+    return this._do('PUT', `/apps/vault/api/credentials/${esc(publicId)}`, {
+      name, url, keychain_sync: keychainSync, data,
+    });
+  }
+
+  async vaultDeleteCredential(publicId) {
+    return this._do('DELETE', `/apps/vault/api/credentials/${esc(publicId)}`);
+  }
+
+  // ── Metrics (TSDB) ─────────────────────────────────────────
+
+  /** Ingest structured metric points. Each is { name, value, type?, tags? }.
+   *  Returns the accepted count. */
+  async ingestMetrics(metrics) {
+    const result = await this._do('POST', '/apps/tsdb/api/ingest', { metrics });
+    return result?.accepted || 0;
+  }
+
+  /** Ingest DogStatsD-format metric lines (text/plain). Returns accepted count. */
+  async ingestDogStatsD(lines) {
+    const headers = { 'Content-Type': 'text/plain' };
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    const resp = await fetch(this.baseUrl + '/apps/tsdb/api/ingest', {
+      method: 'POST', headers, body: lines,
+    });
+    const text = await resp.text();
+    if (!resp.ok) throw new APIError('POST', '/apps/tsdb/api/ingest', resp.status, text);
+    return text ? (JSON.parse(text).accepted || 0) : 0;
+  }
+
+  // ── Notifications ──────────────────────────────────────────
+
+  async createNotification({ title, message = '', app = '', level = '' }) {
+    return this._do('POST', '/api/notifications', { app, level, title, message });
   }
 
   // ── Cache ──────────────────────────────────────────────────
@@ -540,9 +627,39 @@ class AutomationClient {
     return this._client._do('POST', `/apps/automation/api/runs/${runId}/complete`, { status, result, error });
   }
 
+  /**
+   * Run ``work`` in the background and publish its result back to the automation
+   * run when done. ``work`` is an async function returning an object (or null).
+   * Returns true if a runId was supplied (so the handler should respond 202
+   * immediately), false otherwise — mirroring the Go RunAsync pattern. Extract
+   * runId from the request's AUTOMATION_RUN_ID_HEADER header before calling.
+   * @param {string} runId
+   * @param {() => Promise<object|null>} work
+   * @returns {boolean}
+   */
+  runAsync(runId, work) {
+    if (!runId) return false;
+    (async () => {
+      const start = Date.now();
+      let status = 'completed';
+      let error = '';
+      let result = null;
+      try {
+        result = await work();
+      } catch (err) {
+        status = 'failed';
+        error = String(err && err.message ? err.message : err);
+      }
+      if (result === null || result === undefined) result = {};
+      result.duration_ms = Date.now() - start;
+      await this.publishResult(runId, status, result, error);
+    })();
+    return true;
+  }
+
   /** Wait for a run to complete via WebSocket pubsub. Returns the completed run. */
   async waitForRun(runId, { timeout = 3600000 } = {}) {
-    const baseUrl = this._client.baseURL || '';
+    const baseUrl = this._client.baseUrl || '';
     const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://') + '/apps/cache/ws/localitas_automations';
     const consumerId = `sdk-wait-${runId}-${Date.now()}`;
 
@@ -776,4 +893,15 @@ class PubSubWS {
 
 const { Database } = require('./dbapi');
 
-module.exports = { LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef, QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, defaultToken };
+const migrator = require('./migrator');
+const crypto = require('./crypto');
+const scope = require('./scope');
+
+module.exports = {
+  LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef,
+  QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, defaultToken,
+  AUTOMATION_RUN_ID_HEADER,
+  Migrator: migrator.Migrator,
+  crypto,
+  scope,
+};

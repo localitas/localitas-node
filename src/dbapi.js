@@ -22,7 +22,7 @@ class Statement {
     const result = await this._db._client.sqlExec(this._db._dbId, this._sql, ...params);
     return {
       changes: result.rows_affected || 0,
-      lastInsertRowid: result.last_insert_rowid || 0,
+      lastInsertRowid: result.last_insert_id || 0,
     };
   }
 
