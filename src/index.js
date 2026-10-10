@@ -112,11 +112,6 @@ class LocalitasClient {
     return this._do('GET', path);
   }
 
-  async searchHybrid(query, limit = 100, databaseId = '') {
-    const body = { q: query, limit };
-    if (databaseId) body.database_id = databaseId;
-    return this._do('POST', '/apps/data/api/search/hybrid', body);
-  }
 
   // ── Service Registry ───────────────────────────────────────
 
