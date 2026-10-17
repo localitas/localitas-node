@@ -303,7 +303,7 @@ class LocalitasClient {
 
   /** List all named caches. */
   async listCaches() {
-    return this._do('GET', '/apps/cache/api/caches');
+    return (await this._cacheDo('GET', '/apps/cache/api/caches')).caches ?? [];
   }
 
   /** Delete a named cache. Cannot delete 'public_paths'. */
@@ -351,10 +351,33 @@ class LocalitasClient {
 
     return text ? JSON.parse(text) : null;
   }
+
+  /** Call a cache data endpoint and return the result of core's envelope. */
+  async _cacheDo(method, path, body = null) {
+    const r = await this._do(method, path, body);
+    if (r === null || typeof r !== 'object' || !('result' in r)) {
+      throw new Error(`${method} ${path}: response has no result envelope: ${JSON.stringify(r)}`);
+    }
+    return r.result;
+  }
 }
 
 function esc(s) {
   return encodeURIComponent(String(s));
+}
+
+/**
+ * A 404 the cache answered for an absent key, member or element. An unknown
+ * cache is a plain-text 404 and is not a miss.
+ */
+function isMiss(e) {
+  if (!(e instanceof APIError) || e.statusCode !== 404) return false;
+  try {
+    const body = JSON.parse(e.body);
+    return body !== null && typeof body === 'object' && Boolean(body.error);
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -431,57 +454,56 @@ class CacheRef {
   /** Get a key's value. Returns null on miss. */
   async get(key) {
     try {
-      const r = await this._client._do('GET', `${this._base}/keys/${key}`);
-      return r?.result?.value ?? null;
+      const r = await this._client._cacheDo('GET', `${this._base}/keys/${esc(key)}`);
+      return r?.value ?? null;
     } catch (e) {
-      if (e.statusCode === 404) return null;
+      if (isMiss(e)) return null;
       throw e;
     }
   }
 
   /** Set a key with optional TTL in seconds. */
   async set(key, value, ttl = 0) {
-    return this._client._do('PUT', `${this._base}/keys/${key}`, { value, ttl });
+    return this._client._cacheDo('PUT', `${this._base}/keys/${esc(key)}`, { value, ttl });
   }
 
   /** Delete a key. */
   async del(key) {
-    return this._client._do('DELETE', `${this._base}/keys/${key}`);
+    return this._client._cacheDo('DELETE', `${this._base}/keys/${esc(key)}`);
   }
 
   /** Atomically increment. Creates with delta if missing. */
   async incr(key, delta = 1) {
-    const r = await this._client._do('POST', `${this._base}/keys/incr/${key}`, { delta });
-    return r?.result?.value ?? 0;
+    const r = await this._client._cacheDo('POST', `${this._base}/keys/incr/${esc(key)}`, { delta });
+    return r?.value ?? 0;
   }
 
   /** Atomic increment + set TTL only on first call. For rate limiting. */
   async incrWithTTL(key, delta = 1, ttl = 60) {
-    const r = await this._client._do('POST', `${this._base}/keys/incrttl/${key}`, { delta, ttl });
-    return r?.result?.value ?? 0;
+    const r = await this._client._cacheDo('POST', `${this._base}/keys/incrttl/${esc(key)}`, { delta, ttl });
+    return r?.value ?? 0;
   }
 
   /** Set only if key doesn't exist. Returns true if set. For distributed locks. */
   async setNX(key, value, ttl = 0) {
-    const r = await this._client._do('POST', `${this._base}/keys/setnx/${key}`, { value, ttl });
-    return r?.result?.acquired ?? false;
+    const r = await this._client._cacheDo('POST', `${this._base}/keys/setnx/${esc(key)}`, { value, ttl });
+    return r?.acquired ?? false;
   }
 
   /** List keys matching glob pattern. */
   async keys(pattern = '*') {
-    const r = await this._client._do('GET', `${this._base}/keys?pattern=${esc(pattern)}`);
-    return r?.result?.keys ?? [];
+    const r = await this._client._cacheDo('GET', `${this._base}/keys?pattern=${esc(pattern)}`);
+    return r?.keys ?? [];
   }
 
   /** Flush all data in this cache. */
   async flush() {
-    return this._client._do('POST', `${this._base}/flush`);
+    return this._client._cacheDo('POST', `${this._base}/flush`);
   }
 
   /** Get cache stats. */
   async stats() {
-    const r = await this._client._do('GET', `${this._base}/stats`);
-    return r?.result ?? {};
+    return this._client._cacheDo('GET', `${this._base}/stats`);
   }
 
   // ── Data structure accessors ────────────────────────────────
@@ -508,12 +530,12 @@ class ListRef {
     this._c = cache._client;
     this._base = `${cache._base}/lists/${esc(name)}`;
   }
-  async lpush(...values) { return (await this._c._do('POST', `${this._base}/lpush`, { values }))?.result?.length ?? 0; }
-  async rpush(...values) { return (await this._c._do('POST', `${this._base}/rpush`, { values }))?.result?.length ?? 0; }
-  async lpop() { try { return (await this._c._do('POST', `${this._base}/lpop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
-  async rpop() { try { return (await this._c._do('POST', `${this._base}/rpop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
-  async range(start = 0, stop = -1) { return (await this._c._do('GET', `${this._base}?start=${start}&stop=${stop}`))?.result?.values ?? []; }
-  async del() { return this._c._do('DELETE', this._base); }
+  async lpush(...values) { return (await this._c._cacheDo('POST', `${this._base}/lpush`, { values }))?.length ?? 0; }
+  async rpush(...values) { return (await this._c._cacheDo('POST', `${this._base}/rpush`, { values }))?.length ?? 0; }
+  async lpop() { try { return (await this._c._cacheDo('POST', `${this._base}/lpop`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async rpop() { try { return (await this._c._cacheDo('POST', `${this._base}/rpop`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async range(start = 0, stop = -1) { return (await this._c._cacheDo('GET', `${this._base}?start=${start}&stop=${stop}`))?.values ?? []; }
+  async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
 /** Unique unordered set. */
@@ -522,10 +544,10 @@ class SetRef {
     this._c = cache._client;
     this._base = `${cache._base}/sets/${esc(name)}`;
   }
-  async add(...members) { return (await this._c._do('POST', `${this._base}/add`, { members }))?.result?.added ?? 0; }
-  async rem(...members) { return (await this._c._do('POST', `${this._base}/rem`, { members }))?.result?.removed ?? 0; }
-  async members() { return (await this._c._do('GET', this._base))?.result?.members ?? []; }
-  async del() { return this._c._do('DELETE', this._base); }
+  async add(...members) { return (await this._c._cacheDo('POST', `${this._base}/add`, { members }))?.added ?? 0; }
+  async rem(...members) { return (await this._c._cacheDo('POST', `${this._base}/rem`, { members }))?.removed ?? 0; }
+  async members() { return (await this._c._cacheDo('GET', this._base))?.members ?? []; }
+  async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
 /** Field→value map. */
@@ -534,12 +556,12 @@ class HashRef {
     this._c = cache._client;
     this._base = `${cache._base}/hashes/${esc(name)}`;
   }
-  async set(fields) { return this._c._do('PUT', this._base, { fields }); }
-  async get(field) { try { return (await this._c._do('GET', `${this._base}/fields/${esc(field)}`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
-  async getAll() { return (await this._c._do('GET', this._base))?.result?.fields ?? {}; }
-  async toJSON() { return (await this._c._do('GET', `${this._base}/json`))?.result?.json ?? '{}'; }
-  async fromJSON(jsonStr) { return this._c._do('PUT', `${this._base}/json`, { json: jsonStr }); }
-  async del() { return this._c._do('DELETE', this._base); }
+  async set(fields) { return this._c._cacheDo('PUT', this._base, { fields }); }
+  async get(field) { try { return (await this._c._cacheDo('GET', `${this._base}/fields/${esc(field)}`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async getAll() { return (await this._c._cacheDo('GET', this._base))?.fields ?? {}; }
+  async toJSON() { return (await this._c._cacheDo('GET', `${this._base}/json`))?.json ?? '{}'; }
+  async fromJSON(jsonStr) { return this._c._cacheDo('PUT', `${this._base}/json`, { json: jsonStr }); }
+  async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
 /** Members ordered by score. */
@@ -548,13 +570,13 @@ class SortedSetRef {
     this._c = cache._client;
     this._base = `${cache._base}/zsets/${esc(name)}`;
   }
-  async add(...entries) { return (await this._c._do('POST', `${this._base}/add`, { entries: entries.map(([m,s]) => ({member:m,score:s})) }))?.result?.added ?? 0; }
-  async score(member) { try { return (await this._c._do('GET', `${this._base}/score/${esc(member)}`))?.result?.score; } catch(e) { return null; } }
-  async rank(member) { try { return (await this._c._do('GET', `${this._base}/rank/${esc(member)}`))?.result?.rank ?? -1; } catch(e) { return -1; } }
-  async range(start = 0, stop = -1) { return (await this._c._do('GET', `${this._base}?start=${start}&stop=${stop}`))?.result?.entries ?? []; }
-  async rem(...members) { return (await this._c._do('POST', `${this._base}/rem`, { members }))?.result?.removed ?? 0; }
-  async incrBy(member, delta) { return (await this._c._do('POST', `${this._base}/incrby`, { member, delta }))?.result?.score ?? 0; }
-  async del() { return this._c._do('DELETE', this._base); }
+  async add(...entries) { return (await this._c._cacheDo('POST', `${this._base}/add`, { entries: entries.map(([m,s]) => ({member:m,score:s})) }))?.added ?? 0; }
+  async score(member) { try { return (await this._c._cacheDo('GET', `${this._base}/score/${esc(member)}`))?.score; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async rank(member) { try { return (await this._c._cacheDo('GET', `${this._base}/rank/${esc(member)}`))?.rank ?? -1; } catch(e) { if (isMiss(e)) return -1; throw e; } }
+  async range(start = 0, stop = -1) { return (await this._c._cacheDo('GET', `${this._base}?start=${start}&stop=${stop}`))?.entries ?? []; }
+  async rem(...members) { return (await this._c._cacheDo('POST', `${this._base}/rem`, { members }))?.removed ?? 0; }
+  async incrBy(member, delta) { return (await this._c._cacheDo('POST', `${this._base}/incrby`, { member, delta }))?.score ?? 0; }
+  async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
 /** FIFO queue. Bounded queues drop oldest on overflow. */
@@ -564,9 +586,9 @@ class QueueRef {
     this._maxSize = maxSize;
     this._base = `${cache._base}/queues/${esc(name)}`;
   }
-  async enqueue(value) { return (await this._c._do('POST', `${this._base}/enqueue`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
-  async dequeue() { try { return (await this._c._do('POST', `${this._base}/dequeue`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
-  async peek() { try { return (await this._c._do('GET', this._base))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async enqueue(value) { return (await this._c._cacheDo('POST', `${this._base}/enqueue`, { value, max_size: this._maxSize }))?.length ?? 0; }
+  async dequeue() { try { return (await this._c._cacheDo('POST', `${this._base}/dequeue`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async peek() { try { return (await this._c._cacheDo('GET', this._base))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
 }
 
 /** LIFO stack. Bounded stacks drop bottom on overflow. */
@@ -576,9 +598,9 @@ class StackRef {
     this._maxSize = maxSize;
     this._base = `${cache._base}/stacks/${esc(name)}`;
   }
-  async push(value) { return (await this._c._do('POST', `${this._base}/push`, { value, max_size: this._maxSize }))?.result?.length ?? 0; }
-  async pop() { try { return (await this._c._do('POST', `${this._base}/pop`))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
-  async peek() { try { return (await this._c._do('GET', this._base))?.result?.value; } catch(e) { if(e.statusCode===404) return null; throw e; } }
+  async push(value) { return (await this._c._cacheDo('POST', `${this._base}/push`, { value, max_size: this._maxSize }))?.length ?? 0; }
+  async pop() { try { return (await this._c._cacheDo('POST', `${this._base}/pop`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
+  async peek() { try { return (await this._c._cacheDo('GET', this._base))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
 }
 
 /** Durable pub/sub channel with broadcast and consumer groups. */
@@ -594,13 +616,13 @@ class PubSubRef {
     const body = { value };
     if (this._maxSize > 0) body.max_size = this._maxSize;
     if (this._maxAgeSeconds > 0) body.max_age_seconds = this._maxAgeSeconds;
-    return (await this._c._do('POST', `${this._base}/publish`, body))?.result?.seq ?? 0;
+    return (await this._c._cacheDo('POST', `${this._base}/publish`, body))?.seq ?? 0;
   }
-  async read(consumerId, count = 50) { return (await this._c._do('GET', `${this._base}/read?consumer=${esc(consumerId)}&count=${count}`))?.result?.messages ?? []; }
-  async createGroup(groupName) { return this._c._do('POST', `${this._base}/group/${esc(groupName)}`); }
-  async claim(groupName, consumerId) { return (await this._c._do('POST', `${this._base}/group/${esc(groupName)}/claim?consumer=${esc(consumerId)}`))?.result?.message; }
-  async ack(groupName, seq) { return this._c._do('POST', `${this._base}/group/${esc(groupName)}/ack`, { seq }); }
-  async del() { return this._c._do('DELETE', this._base); }
+  async read(consumerId, count = 50) { return (await this._c._cacheDo('GET', `${this._base}/read?consumer=${esc(consumerId)}&count=${count}`))?.messages ?? []; }
+  async createGroup(groupName) { return this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}`); }
+  async claim(groupName, consumerId) { return (await this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/claim?consumer=${esc(consumerId)}`))?.message; }
+  async ack(groupName, seq) { return this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/ack`, { seq }); }
+  async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
 const WebSocket = require('ws');
