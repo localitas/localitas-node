@@ -1,5 +1,3 @@
-const { LocalitasClient } = require('./index');
-
 function rowsToObjects(columns, rows) {
   if (!columns || !rows) return [];
   return rows.map(row => {
@@ -52,6 +50,9 @@ class Database {
     const protocol = host.startsWith('https') ? '' : 'http://';
     const baseUrl = host.includes('://') ? host : `${protocol}${host}`;
     this._dbId = dbId;
+    // Resolved here, not at load: index.js requires this module before it
+    // has exported LocalitasClient, so a load-time import is undefined.
+    const { LocalitasClient } = require('./index');
     this._client = new LocalitasClient(baseUrl, token);
   }
 
