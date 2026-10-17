@@ -8,11 +8,9 @@ const { LocalitasClient } = require('../src/index.js');
 const assert = require('assert');
 
 const INTEG_URL = 'http://localhost:9090';
-const INTEG_TOKEN = Buffer.from(JSON.stringify({
-  user_id: '11111111-1111-1111-1111-111111111111',
-  email: 'alice@test.local',
-  name: 'Alice Admin',
-})).toString('base64');
+// The integration cluster's seeded API token for alice@test.local
+// (core seeds/005_integ_api_token.sql).
+const INTEG_TOKEN = 'lt_integ_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2';
 
 function makeClient() {
   return new LocalitasClient(INTEG_URL).withToken(INTEG_TOKEN);
@@ -204,10 +202,10 @@ async function main() {
   if (WebSocket) {
     await test('websocket subscribe and publish', () => withCache('ws', async (cache) => {
       const name = cache._name;
-      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}?token=${INTEG_TOKEN}`;
+      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}`;
 
       return new Promise((resolve, reject) => {
-        const ws = new WebSocket(wsUrl);
+        const ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${INTEG_TOKEN}` } });
         const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
 
         let step = 0;
@@ -238,12 +236,12 @@ async function main() {
 
     await test('websocket two clients broadcast', () => withCache('ws2', async (cache) => {
       const name = cache._name;
-      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}?token=${INTEG_TOKEN}`;
+      const wsUrl = `ws://localhost:9090/apps/cache/ws/${name}`;
 
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => { reject(new Error('timeout')); }, 5000);
-        const ws1 = new WebSocket(wsUrl);
-        const ws2 = new WebSocket(wsUrl);
+        const ws1 = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${INTEG_TOKEN}` } });
+        const ws2 = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${INTEG_TOKEN}` } });
         let ws1Ready = false, ws2Ready = false, ws2Received = false;
 
         function bothReady() {
