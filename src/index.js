@@ -155,17 +155,40 @@ class LocalitasClient {
 
   // ── Permissions ────────────────────────────────────────────
 
-  async setResourceOwner(app, resourceType, resourceId, ownerId) {
+  /** Make the calling user the owner of an unowned resource (or one it already owns). */
+  async claimResource(app, resourceType, resourceId) {
     return this._do('POST', '/api/permissions/set-owner', {
-      app, resource_type: resourceType, resource_id: resourceId, owner_id: ownerId,
+      app, resource_type: resourceType, resource_id: resourceId,
     });
   }
 
-  async checkPermission(app, resourceType, resourceId, userId = '') {
-    const body = { app, resource_type: resourceType, resource_id: resourceId };
-    if (userId) body.user_id = userId;
-    const result = await this._do('POST', '/api/permissions/check', body);
+  /** The calling user's permission on a resource ('' for none). */
+  async checkPermission(app, resourceType, resourceId) {
+    const result = await this._do('POST', '/api/permissions/check', {
+      app, resource_type: resourceType, resource_id: resourceId,
+    });
     return result?.permission || '';
+  }
+
+  // The *AsUser methods let an app backend, holding an admin-scoped system
+  // token, act for the user making the request.
+
+  async setResourceOwnerAsUser(userId, app, resourceType, resourceId) {
+    return this._do('POST', `/api/permissions/users/${esc(userId)}/set-owner`, {
+      app, resource_type: resourceType, resource_id: resourceId,
+    });
+  }
+
+  async checkPermissionAsUser(userId, app, resourceType, resourceId) {
+    const result = await this._do('POST', `/api/permissions/users/${esc(userId)}/check`, {
+      app, resource_type: resourceType, resource_id: resourceId,
+    });
+    return result?.permission || '';
+  }
+
+  async deleteResourcePermissionsAsUser(userId, app, resourceType, resourceId) {
+    const path = `/api/permissions/users/${esc(userId)}/resources/${esc(app)}/${esc(resourceType)}/${esc(resourceId)}`;
+    return this._do('DELETE', path);
   }
 
   async listResourceMembers(app, resourceType, resourceId) {
