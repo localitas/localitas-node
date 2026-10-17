@@ -28,14 +28,38 @@ describe('scope', () => {
     assert.ok(scope.hasScope(scope.SCOPE_ADMIN, scope.SCOPE_WRITE));
     assert.ok(!scope.hasScope(scope.SCOPE_READ, scope.SCOPE_WRITE));
   });
-  it('parses a bearer token', () => {
-    const claims = { user_id: 'u1', email: 'a@b.c', permission: 'write' };
-    const token = Buffer.from(JSON.stringify(claims)).toString('base64');
-    assert.strictEqual(scope.parseBearerToken(token).user_id, 'u1');
+  const TEST_API_TOKEN = 'lt_test_cluster_token';
+  // What core signs for these claims under TEST_API_TOKEN; core's
+  // internal/auth golden test pins the same string.
+  const GOLDEN = 'eyJlbWFpbCI6ImFsaWNlQHRlc3QubG9jYWwiLCJuYW1lIjoiQWxpY2UiLCJ1c2VyX2lkIjoidTEiLCJwZXJtaXNzaW9uIjoid3JpdGUifQ.qpBZu3EVKLK3lKw_8Y2WD_VP9nCqx849D30L0r9fo5Y';
+  const nodeCrypto = require('crypto');
+  const sign = (apiToken, claims) => {
+    const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+    const key = Buffer.from(nodeCrypto.createHash('sha256').update('localitas-internal-token-v1:' + apiToken).digest().toString('base64'));
+    return payload + '.' + nodeCrypto.createHmac('sha256', key).update(payload).digest('base64url');
+  };
+  before(() => scope.setIdentityKeyFromApiToken(TEST_API_TOKEN));
+
+  it("verifies core's signed token", () => {
+    const c = scope.parseBearerToken(GOLDEN);
+    assert.deepStrictEqual([c.user_id, c.email, c.name, c.permission], ['u1', 'alice@test.local', 'Alice', 'write']);
+  });
+  it('refuses forged tokens', () => {
+    const claims = { user_id: 'alice', permission: 'admin' };
+    const sig = sign(TEST_API_TOKEN, { user_id: 'bob' }).split('.')[1];
+    const forgeries = {
+      unsigned: Buffer.from(JSON.stringify(claims)).toString('base64'),
+      'other key': sign('another-cluster', claims),
+      'edited claims': Buffer.from(JSON.stringify(claims)).toString('base64url') + '.' + sig,
+      'lt_ token': 'lt_abc',
+    };
+    for (const [name, token] of Object.entries(forgeries)) {
+      assert.throws(() => scope.parseBearerToken(token), Error, name);
+      assert.throws(() => scope.requireScope('Bearer ' + token, scope.SCOPE_READ), (e) => e.status === 401, name);
+    }
   });
   it('grants and denies via requireScope', () => {
-    const claims = { user_id: 'u1', email: 'a@b.c', permission: 'write' };
-    const header = 'Bearer ' + Buffer.from(JSON.stringify(claims)).toString('base64');
+    const header = 'Bearer ' + sign(TEST_API_TOKEN, { user_id: 'u1', email: 'a@b.c', permission: 'write' });
     assert.strictEqual(scope.requireScope(header, scope.SCOPE_WRITE).user_id, 'u1');
     assert.throws(() => scope.requireScope(header, scope.SCOPE_ADMIN), (e) => e.status === 403);
     assert.throws(() => scope.requireScope('', scope.SCOPE_READ), (e) => e.status === 401);
