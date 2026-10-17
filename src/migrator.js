@@ -20,15 +20,20 @@ class Migrator {
    * @param {string} migrationsDir - directory of .sql files
    * @param {(sql: string, ...args) => Promise<any>} execSql - e.g. (s,...a) => client.sqlExec(dbId, s, ...a)
    * @param {(sql: string, ...args) => Promise<any>} querySql - e.g. (s,...a) => client.sqlQuery(dbId, s, ...a)
+   * @param {(stmts: {sql: string, args: any[]}[]) => Promise<any>} execTx - applies the statements as one
+   *   transaction, e.g. (stmts) => client.sqlTransaction(dbId, stmts)
    */
-  constructor(migrationsDir, execSql, querySql) {
+  constructor(migrationsDir, execSql, querySql, execTx) {
     this._exec = execSql;
     this._query = querySql;
+    this._execTx = execTx;
     this._migrations = loadMigrations(migrationsDir);
   }
 
-  /** Apply all pending migrations. Idempotent — applied migrations are skipped
-   *  and "already exists" errors are tolerated. */
+  /** Apply every pending migration. Each is one transaction that records its
+   *  version before its statements, so it applies whole or not at all, and of
+   *  several instances migrating at once exactly one applies it: the others'
+   *  transactions fail on the version's primary key. */
   async run() {
     await this._exec(
       'CREATE TABLE IF NOT EXISTS schema_migrations (' +
@@ -40,19 +45,45 @@ class Migrator {
 
     for (const m of this._migrations) {
       if (applied.has(m.version)) continue;
-      for (const stmt of splitSql(m.sql)) {
-        try {
-          await this._exec(stmt);
-        } catch (err) {
-          if (!isIdempotentError(err)) throw err;
-        }
+      try {
+        await this._apply(m);
+      } catch (err) {
+        if (isVersionTaken(err)) continue;
+        if (!isIdempotentError(err)) throw err;
+        // The schema change is in place without its version row (a database
+        // migrated before migrations were atomic).
+        await this._repair(m);
       }
-      await this._exec(
-        'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
-        m.version, m.name, Math.floor(Date.now() / 1000)
-      );
     }
   }
+
+  async _apply(m) {
+    await this._execTx([
+      {
+        sql: 'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
+        args: [m.version, m.name, Math.floor(Date.now() / 1000)],
+      },
+      ...splitSql(m.sql).map((sql) => ({ sql, args: [] })),
+    ]);
+  }
+
+  async _repair(m) {
+    for (const stmt of splitSql(m.sql)) {
+      try {
+        await this._exec(stmt);
+      } catch (err) {
+        if (!isIdempotentError(err)) throw err;
+      }
+    }
+    await this._exec(
+      'INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
+      m.version, m.name, Math.floor(Date.now() / 1000)
+    );
+  }
+}
+
+function isVersionTaken(err) {
+  return String(err && err.message ? err.message : err).includes('UNIQUE constraint failed: schema_migrations.version');
 }
 
 function loadMigrations(dir) {
