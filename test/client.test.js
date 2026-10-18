@@ -13,7 +13,10 @@ const routes = {
     return [200, [{ id: 'db1', name: 'mydb' }]];
   },
   'POST /apps/data/api/databases': (req, body) => {
-    return [200, { id: 'db2', name: body.name, system: body.system || false }];
+    return [200, { id: 'db2', name: body.name, system: false }];
+  },
+  'POST /apps/data/api/system-dbs': (req, body) => {
+    return [200, { id: 'db3', name: body.name, system: true }];
   },
   'GET /apps/data/api/databases/db1': () => [200, { id: 'db1', name: 'mydb' }],
   'DELETE /apps/data/api/databases/db1': () => [200, null],

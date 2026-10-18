@@ -39,9 +39,8 @@ class LocalitasClient {
   }
 
   async createDatabase(name, system = false) {
-    const body = { name };
-    if (system) body.system = true;
-    return this._do('POST', '/apps/data/api/databases', body);
+    if (system) return this._do('POST', '/apps/data/api/system-dbs', { name });
+    return this._do('POST', '/apps/data/api/databases', { name });
   }
 
   async getDatabase(dbId) {
