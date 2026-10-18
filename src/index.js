@@ -12,6 +12,9 @@
 // ID a handler publishes its async result back to (see AutomationClient.runAsync).
 const AUTOMATION_RUN_ID_HEADER = 'Localitas-Automation-Run-ID';
 
+// How close to its expiry a client refreshes the identity token it acts with.
+const REFRESH_BEFORE_SECONDS = 60;
+
 class APIError extends Error {
   constructor(method, path, statusCode, body) {
     super(`${method} ${path}: ${statusCode} ${body}`);
@@ -26,6 +29,43 @@ class LocalitasClient {
   constructor(baseUrl, token = '') {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.token = token;
+    /** Unix seconds now; identity tokens are refreshed against it. */
+    this.now = () => Date.now() / 1000;
+  }
+
+  /** The token to send. An identity token within a minute of its expiry is
+   *  first refreshed with core (POST /api/auth/identity/refresh), up to the
+   *  max claim core fixed when it minted it; if the refresh fails the current
+   *  token is sent and core decides. */
+  async _bearer() {
+    if (!this.token) return '';
+    const { unverifiedClaims } = require('./scope');
+    const claims = unverifiedClaims(this.token);
+    const exp = Number(claims.exp || 0);
+    const max = Number(claims.max || 0);
+    if (exp && max > exp && exp - this.now() < REFRESH_BEFORE_SECONDS) {
+      try {
+        const resp = await fetch(this.baseUrl + '/api/auth/identity/refresh', {
+          method: 'POST', headers: { Authorization: `Bearer ${this.token}` },
+        });
+        if (resp.ok) {
+          const body = await resp.json();
+          if (body && body.token) this.token = body.token;
+        }
+      } catch (_) {
+        // keep the current token; core decides
+      }
+    }
+    return this.token;
+  }
+
+  /** Ask core for a short-lived identity token for an existing user, so the
+   *  app's background work can act as that user. Only core's system token may
+   *  ask; core grants at most write, never more than the user's own
+   *  permission, caps the lifetime at 15 minutes and audit-logs it. */
+  async identityForUser(userId, permission = 'read', ttlSeconds = 300) {
+    const resp = await this._do('POST', '/api/auth/identity/for-user', { user_id: userId, permission, ttl_seconds: ttlSeconds });
+    return (resp && resp.token) || '';
   }
 
   withToken(token) {
@@ -278,7 +318,8 @@ class LocalitasClient {
   /** Ingest DogStatsD-format metric lines (text/plain). Returns accepted count. */
   async ingestDogStatsD(lines) {
     const headers = { 'Content-Type': 'text/plain' };
-    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    const bearer = await this._bearer();
+    if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
     const resp = await fetch(this.baseUrl + '/apps/tsdb/api/ingest', {
       method: 'POST', headers, body: lines,
     });
@@ -333,8 +374,9 @@ class LocalitasClient {
       headers: {},
     };
 
-    if (this.token) {
-      opts.headers['Authorization'] = `Bearer ${this.token}`;
+    const bearer = await this._bearer();
+    if (bearer) {
+      opts.headers['Authorization'] = `Bearer ${bearer}`;
     }
     if (body !== null) {
       opts.headers['Content-Type'] = 'application/json';
