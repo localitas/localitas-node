@@ -279,6 +279,70 @@ async function main() {
     }));
   }
 
+  if (WebSocket) {
+    const { PubSubWS } = require('../src/index.js');
+    // nextMessages resolves with the next n messages a watch hands over.
+    const collector = () => {
+      const got = [];
+      const waiters = [];
+      const add = (msg) => {
+        got.push(msg);
+        waiters.filter((w) => got.length >= w.n).forEach((w) => w.resolve(got.slice(0, w.n)));
+      };
+      const next = (n) => new Promise((resolve, reject) => {
+        if (got.length >= n) return resolve(got.slice(0, n));
+        waiters.push({ n, resolve });
+        setTimeout(() => reject(new Error(`got ${JSON.stringify(got)}, wanted ${n}`)), 10000);
+      });
+      return { add, next, got };
+    };
+
+    await test('watch after the noted last seq', () => withCache('watch', async (cache) => {
+      const ch = cache.pubSub('events');
+      await ch.publish('a');
+      await ch.publish('b');
+      const noted = await ch.lastSeq();
+      assert.strictEqual(noted, 2);
+      await ch.publish('c');
+
+      const ps = new PubSubWS({ url: `ws://localhost:9090/apps/cache/ws/${cache._name}`, token: INTEG_TOKEN });
+      try {
+        const seen = collector();
+        ps.watch('events', noted, seen.add);
+        const [first] = await seen.next(1);
+        assert.deepStrictEqual([first.seq, first.value], [3, 'c']);
+        await ch.publish('d');
+        const both = await seen.next(2);
+        assert.deepStrictEqual([both[1].seq, both[1].value], [4, 'd']);
+      } finally {
+        ps.close();
+      }
+    }));
+
+    await test('watchLatest sees only what comes next', () => withCache('watch', async (cache) => {
+      const ch = cache.pubSub('events');
+      for (const v of ['old1', 'old2', 'old3']) await ch.publish(v);
+
+      const ps = new PubSubWS({ url: `ws://localhost:9090/apps/cache/ws/${cache._name}`, token: INTEG_TOKEN });
+      try {
+        const started = new Promise((resolve, reject) => {
+          ps.on('subscribed', resolve);
+          setTimeout(() => reject(new Error('the watch never started')), 10000);
+        });
+        const seen = collector();
+        ps.watchLatest('events', seen.add);
+        await started;
+        await ch.publish('new');
+        const [msg] = await seen.next(1);
+        assert.deepStrictEqual([msg.seq, msg.value], [4, 'new']);
+        await new Promise((r) => setTimeout(r, 200));
+        assert.strictEqual(seen.got.length, 1, 'the watch delivered more than what came next');
+      } finally {
+        ps.close();
+      }
+    }));
+  }
+
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }
