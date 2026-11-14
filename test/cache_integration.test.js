@@ -298,22 +298,24 @@ async function main() {
     };
 
     await test('watch after the noted last seq', () => withCache('watch', async (cache) => {
+      // Numbers come from the cluster's log: they only increase.
       const ch = cache.pubSub('events');
       await ch.publish('a');
-      await ch.publish('b');
+      const b = await ch.publish('b');
       const noted = await ch.lastSeq();
-      assert.strictEqual(noted, 2);
-      await ch.publish('c');
+      assert.strictEqual(noted, b);
+      const c = await ch.publish('c');
 
       const ps = new PubSubWS({ url: `ws://localhost:9090/apps/cache/ws/${cache._name}`, token: INTEG_TOKEN });
       try {
         const seen = collector();
         ps.watch('events', noted, seen.add);
         const [first] = await seen.next(1);
-        assert.deepStrictEqual([first.seq, first.value], [3, 'c']);
-        await ch.publish('d');
+        assert.deepStrictEqual([first.seq, first.value], [c, 'c']);
+        const d = await ch.publish('d');
         const both = await seen.next(2);
-        assert.deepStrictEqual([both[1].seq, both[1].value], [4, 'd']);
+        assert.deepStrictEqual([both[1].seq, both[1].value], [d, 'd']);
+        assert.ok(noted < c && c < d, `numbers ${noted}, ${c}, ${d} do not increase`);
       } finally {
         ps.close();
       }
@@ -332,9 +334,9 @@ async function main() {
         const seen = collector();
         ps.watchLatest('events', seen.add);
         await started;
-        await ch.publish('new');
+        const fresh = await ch.publish('new');
         const [msg] = await seen.next(1);
-        assert.deepStrictEqual([msg.seq, msg.value], [4, 'new']);
+        assert.deepStrictEqual([msg.seq, msg.value], [fresh, 'new']);
         await new Promise((r) => setTimeout(r, 200));
         assert.strictEqual(seen.got.length, 1, 'the watch delivered more than what came next');
       } finally {
