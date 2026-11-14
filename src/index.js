@@ -746,31 +746,40 @@ class AutomationClient {
     return true;
   }
 
-  /** Wait for a run to complete via WebSocket pubsub. Returns the completed run. */
+  /**
+   * Return the run once it has finished, without polling it.
+   *
+   * Every finished run is announced once on the completions channel, after
+   * its outcome is recorded. This notes the channel's last message, then
+   * reads the run; the read is linearizable, so a run whose completion is at
+   * or before the noted message is read finished. A run still going is
+   * waited for by watching the channel after the noted message: its
+   * completion comes after it, so it cannot be missed.
+   */
   async waitForRun(runId, { timeout = 3600000 } = {}) {
+    const noted = await this._client.cache('localitas_automations').pubSub('completions').lastSeq();
+    const run = await this.getRun(runId);
+    if (run.status !== 'running' && run.status !== 'pending') return run;
+
     const baseUrl = this._client.baseUrl || '';
     const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://') + '/apps/cache/ws/localitas_automations';
-    const consumerId = `sdk-wait-${runId}-${Date.now()}`;
-
-    return new Promise((resolve, reject) => {
-      const ps = new PubSubWS({ url: wsUrl, token: this._client.token });
-      const timer = setTimeout(() => {
-        ps.close();
-        reject(new Error(`Timeout waiting for run ${runId}`));
-      }, timeout);
-
-      ps.subscribe('completions', consumerId, async (msg) => {
-        try {
-          const payload = JSON.parse(msg.value || '{}');
-          if (payload.run_id === runId) {
+    const ps = new PubSubWS({ url: wsUrl, token: this._client.token });
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Timeout waiting for run ${runId}`)), timeout);
+        ps.watch('completions', noted, (msg) => {
+          let announced = {};
+          try { announced = JSON.parse(msg.value || '{}'); } catch (_) { return; }
+          if (announced.run_id === runId) {
             clearTimeout(timer);
-            const run = await this.getRun(runId);
-            ps.close();
-            resolve(run);
+            resolve();
           }
-        } catch (e) {}
+        });
       });
-    });
+      return await this.getRun(runId);
+    } finally {
+      ps.close();
+    }
   }
 }
 
