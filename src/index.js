@@ -664,6 +664,14 @@ class PubSubRef {
   async claim(groupName, consumerId) { return (await this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/claim?consumer=${esc(consumerId)}`))?.message; }
   async ack(groupName, seq) { return this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/ack`, { seq }); }
   async del() { return this._c._cacheDo('DELETE', this._base); }
+  /** Describe the channel on the node asked: name, message_count, last_message_at, last_seq. */
+  async info() { return this._c._cacheDo('GET', this._base); }
+  /**
+   * The newest message's sequence number on the node asked. Note it before
+   * starting something whose outcome is published here, then
+   * PubSubWS.watch after it, and the outcome cannot be missed.
+   */
+  async lastSeq() { return (await this.info())?.last_seq ?? 0; }
 }
 
 const WebSocket = require('ws');
@@ -806,10 +814,47 @@ class PubSubWS {
    * @param {Function} callback - Called with { seq, value, channel } for each message.
    */
   subscribe(channel, consumer, callback) {
-    this._subscriptions[channel] = { consumer, callback };
+    this._start(channel, { consumer, callback });
+  }
+
+  /**
+   * Watch a channel: the callback fires for each message published after
+   * afterSeq, as the server's node applies it. A watch keeps no cursor and
+   * asks the cluster for nothing. To miss nothing a later action publishes,
+   * note PubSubRef.lastSeq() before the action and watch after it. A
+   * reconnect resumes after the last message delivered.
+   *
+   * @param {string} channel - Channel name to watch.
+   * @param {number} afterSeq - Deliver messages after this sequence number.
+   * @param {Function} callback - Called with { seq, value, channel } for each message.
+   */
+  watch(channel, afterSeq, callback) {
+    this._start(channel, { callback, watch: true, after: afterSeq, fromLatest: false });
+  }
+
+  /**
+   * watch from the channel's newest message when the watch starts.
+   *
+   * @param {string} channel - Channel name to watch.
+   * @param {Function} callback - Called with { seq, value, channel } for each message.
+   */
+  watchLatest(channel, callback) {
+    this._start(channel, { callback, watch: true, after: 0, fromLatest: true });
+  }
+
+  /** @private */
+  _start(channel, sub) {
+    this._subscriptions[channel] = sub;
     if (this._isConnected()) {
-      this._send({ action: 'subscribe', channel, consumer });
+      this._send(PubSubWS._request(channel, sub));
     }
+  }
+
+  /** @private */
+  static _request(channel, sub) {
+    if (!sub.watch) return { action: 'subscribe', channel, consumer: sub.consumer };
+    if (sub.fromLatest) return { action: 'watch', channel, from_latest: true };
+    return { action: 'watch', channel, seq: sub.after };
   }
 
   /**
@@ -889,20 +934,17 @@ class PubSubWS {
 
   /** @private */
   _connect() {
-    let url = this.url;
-    if (this.token) {
-      url += (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(this.token);
-    }
-
-    this._ws = new WebSocket(url);
+    // The server authenticates the upgrade by its Authorization header (a
+    // query token is not read), as the Go and Python clients send it.
+    const headers = this.token ? { Authorization: `Bearer ${this.token}` } : {};
+    this._ws = new WebSocket(this.url, { headers });
 
     this._ws.on('open', () => {
       this._reconnectAttempts = 0;
       this._emit('connected');
 
       for (const channel in this._subscriptions) {
-        const sub = this._subscriptions[channel];
-        this._send({ action: 'subscribe', channel, consumer: sub.consumer });
+        this._send(PubSubWS._request(channel, this._subscriptions[channel]));
       }
     });
 
@@ -930,8 +972,23 @@ class PubSubWS {
 
   /** @private */
   _handleMessage(msg) {
+    // The server's greeting is the socket opening, already emitted as
+    // 'connected': a second one would run connect handlers twice.
+    if (msg.type && msg.type !== 'connected') this._emit(msg.type, msg);
+    if (msg.type === 'subscribed' && msg.channel) {
+      const sub = this._subscriptions[msg.channel];
+      if (sub && sub.watch && sub.fromLatest) {
+        sub.after = msg.seq || 0;
+        sub.fromLatest = false;
+      }
+    }
     if (msg.type === 'message' && msg.channel) {
       const sub = this._subscriptions[msg.channel];
+      if (sub && sub.watch) {
+        // A resumed watch may resend what came before the drop.
+        if ((msg.seq || 0) <= sub.after) return;
+        sub.after = msg.seq || 0;
+      }
       if (sub && sub.callback) {
         sub.callback({ seq: msg.seq, value: msg.value, channel: msg.channel });
       }
