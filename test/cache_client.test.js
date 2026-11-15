@@ -233,4 +233,133 @@ describe('cache client', () => {
     await ch.ack('workers', 2);
     await rejectsWith(ch.claim('nope', 'w1'), 404);
   });
+
+  it('getConsistent asks for a consistent read; a miss is null', async () => {
+    route('GET', `${BASE}/keys/k1`, ok({ key: 'k1', value: 'v1', ttl_remaining: -1 }));
+    route('GET', `${BASE}/keys/absent`, miss('key not found'));
+    route('GET', `${BASE}/keys/k`, UNKNOWN_CACHE);
+    route('GET', `${BASE}/keys/busy`, fail(503, 'consistent read: raft: not ready'));
+    const cache = client.cache('test');
+
+    assert.strictEqual(await cache.getConsistent('k1'), 'v1');
+    assert.strictEqual(last().query, 'consistent=true');
+    await cache.get('k1');
+    assert.strictEqual(last().query, '');
+    assert.strictEqual(await cache.getConsistent('absent'), null);
+    await rejectsWith(cache.getConsistent('k'), 404);
+    await rejectsWith(cache.getConsistent('busy'), 503);
+  });
+
+  it('ttl reads the remaining seconds; -2 for an absent key', async () => {
+    route('GET', `${BASE}/keys/forever`, ok({ key: 'forever', value: 'v', ttl_remaining: -1 }));
+    route('GET', `${BASE}/keys/soon`, ok({ key: 'soon', value: 'v', ttl_remaining: 42 }));
+    route('GET', `${BASE}/keys/absent`, miss('key not found'));
+    route('GET', `${BASE}/keys/k`, UNKNOWN_CACHE);
+    route('GET', `${BASE}/keys/busy`, fail(500, 'database is locked'));
+    const cache = client.cache('test');
+
+    assert.strictEqual(await cache.ttl('forever'), -1);
+    assert.strictEqual(await cache.ttl('soon'), 42);
+    assert.strictEqual(await cache.ttl('absent'), -2);
+    assert.strictEqual(calls.length, 3);
+    await rejectsWith(cache.ttl('k'), 404);
+    await rejectsWith(cache.ttl('busy'), 500);
+  });
+
+  it('expire is false for an absent key and raises everything else', async () => {
+    route('POST', `${BASE}/keys/expire/a%2Fb`, ok({ status: 'ok' }));
+    route('POST', `${BASE}/keys/expire/absent`, miss('key not found'));
+    route('POST', `${BASE}/keys/expire/k`, fail(400, 'ttl is required and must be positive'));
+    route('POST', `${BASE}/keys/expire/gone`, UNKNOWN_CACHE);
+    const cache = client.cache('test');
+
+    assert.strictEqual(await cache.expire('a/b', 30), true);
+    assert.deepStrictEqual(JSON.parse(last().body), { ttl: 30 });
+    assert.strictEqual(await cache.expire('absent', 30), false);
+    await rejectsWith(cache.expire('k', 0), 400);
+    await rejectsWith(cache.expire('gone', 30), 404);
+  });
+
+  it('getSet returns the old value, null when there was none', async () => {
+    route('POST', `${BASE}/keys/getset/lock`, ok({ had_old: true, key: 'lock', old_value: 'owner-a' }));
+    route('POST', `${BASE}/keys/getset/empty`, ok({ had_old: true, key: 'empty', old_value: '' }));
+    route('POST', `${BASE}/keys/getset/new`, ok({ had_old: false, key: 'new', old_value: '' }));
+    route('POST', `${BASE}/keys/getset/k`, UNKNOWN_CACHE);
+    route('POST', `${BASE}/keys/getset/busy`, fail(500, 'database is locked'));
+    const cache = client.cache('test');
+
+    assert.strictEqual(await cache.getSet('lock', 'owner-c', 60), 'owner-a');
+    assert.deepStrictEqual(JSON.parse(last().body), { value: 'owner-c', ttl: 60 });
+    assert.strictEqual(await cache.getSet('empty', 'x'), '');
+    assert.strictEqual(await cache.getSet('new', 'x'), null);
+    await rejectsWith(cache.getSet('k', 'v'), 404);
+    await rejectsWith(cache.getSet('busy', 'v'), 500);
+  });
+
+  it('list len reads the length', async () => {
+    route('GET', `${BASE}/lists/jobs`, ok({ length: 3, values: ['a', 'b', 'c'] }));
+    route('GET', `${BASE}/lists/gone`, UNKNOWN_CACHE);
+    const cache = client.cache('test');
+
+    assert.strictEqual(await cache.list('jobs').len(), 3);
+    assert.strictEqual(last().query, 'start=0&stop=-1');
+    await rejectsWith(cache.list('gone').len(), 404);
+  });
+
+  it('hash delFields deletes each field and counts the removed', async () => {
+    const h = `${BASE}/hashes/user%3A1`;
+    route('DELETE', `${h}/fields/name`, ok({ removed: 1 }));
+    route('DELETE', `${h}/fields/a%2Fb`, ok({ removed: 0 }));
+    route('DELETE', `${h}/fields/city`, ok({ removed: 1 }));
+    route('DELETE', `${BASE}/hashes/h/fields/a`, UNKNOWN_CACHE);
+    route('DELETE', `${BASE}/hashes/h/fields/b`, fail(500, 'database is locked'));
+    const user = client.cache('test').hash('user:1');
+
+    assert.strictEqual(await user.delFields('name', 'a/b', 'city'), 2);
+    assert.deepStrictEqual(calls.map((c) => c.path), [`${h}/fields/name`, `${h}/fields/a%2Fb`, `${h}/fields/city`]);
+    assert.strictEqual(await user.delFields(), 0);
+    assert.strictEqual(calls.length, 3);
+    await rejectsWith(client.cache('test').hash('h').delFields('a'), 404);
+    await rejectsWith(client.cache('test').hash('h').delFields('b'), 500);
+  });
+
+  it('sorted set rangeByScore sends the bounds', async () => {
+    const entries = [{ member: 'bob', score: 150 }, { member: 'alice', score: 200.5 }];
+    route('GET', `${BASE}/zsets/board/byscore`, ok({ count: 2, entries }));
+    route('GET', `${BASE}/zsets/busy/byscore`, fail(500, 'database is locked'));
+    route('GET', `${BASE}/zsets/gone/byscore`, UNKNOWN_CACHE);
+    const cache = client.cache('test');
+
+    assert.deepStrictEqual(await cache.sortedSet('board').rangeByScore(100, 200.5), entries);
+    assert.deepStrictEqual(Object.fromEntries(new URLSearchParams(last().query)), { min: '100', max: '200.5' });
+    await rejectsWith(cache.sortedSet('busy').rangeByScore(0, 1), 500);
+    await rejectsWith(cache.sortedSet('gone').rangeByScore(0, 1), 404);
+  });
+
+  it('pubsub reclaim and trim', async () => {
+    const ps = `${BASE}/pubsub/events`;
+    const msgs = [{ seq: 2, value: 'job-1', created_at: 102 }];
+    route('POST', `${ps}/group/workers/reclaim`, ok({ count: 1, messages: msgs }));
+    route('POST', `${ps}/trim`, ok({ removed: 4 }));
+    const ch = client.cache('test').pubSub('events');
+
+    assert.deepStrictEqual(await ch.reclaim('workers', 'worker 2', 60), msgs);
+    assert.deepStrictEqual(Object.fromEntries(new URLSearchParams(last().query)), { consumer: 'worker 2', timeout: '60' });
+    await ch.reclaim('workers', 'w2');
+    assert.strictEqual(new URLSearchParams(last().query).get('timeout'), '30');
+    assert.strictEqual(await ch.trim(3600), 4);
+    assert.deepStrictEqual(JSON.parse(last().body), { max_age: 3600 });
+  });
+
+  it('pubsub reclaim and trim failures raise', async () => {
+    const ps = `${BASE}/pubsub/events`;
+    route('POST', `${ps}/group/workers/reclaim`, UNKNOWN_CACHE);
+    route('POST', `${ps}/group/busy/reclaim`, fail(500, 'database is locked'));
+    route('POST', `${ps}/trim`, fail(400, 'max_age or max_size required'));
+    const ch = client.cache('test').pubSub('events');
+
+    await rejectsWith(ch.reclaim('workers', 'w2'), 404);
+    await rejectsWith(ch.reclaim('busy', 'w2'), 500);
+    await rejectsWith(ch.trim(0), 400);
+  });
 });

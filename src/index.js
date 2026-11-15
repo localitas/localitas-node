@@ -494,8 +494,23 @@ class CacheRef {
 
   /** Get a key's value. Returns null on miss. */
   async get(key) {
+    return this._get(`${this._base}/keys/${esc(key)}`);
+  }
+
+  /**
+   * get that sees every write committed before it, through whichever node it
+   * entered: a plain read answers from that node's own copy, which may not
+   * yet hold a write made through another node a moment ago. Use it where a
+   * stale value is wrong, such as a count of failed logons.
+   */
+  async getConsistent(key) {
+    return this._get(`${this._base}/keys/${esc(key)}?consistent=true`);
+  }
+
+  /** @private */
+  async _get(path) {
     try {
-      const r = await this._client._cacheDo('GET', `${this._base}/keys/${esc(key)}`);
+      const r = await this._client._cacheDo('GET', path);
       return r?.value ?? null;
     } catch (e) {
       if (isMiss(e)) return null;
@@ -506,6 +521,40 @@ class CacheRef {
   /** Set a key with optional TTL in seconds. */
   async set(key, value, ttl = 0) {
     return this._client._cacheDo('PUT', `${this._base}/keys/${esc(key)}`, { value, ttl });
+  }
+
+  /**
+   * Remaining time-to-live in seconds: -1 if the key has no expiry, -2 if it
+   * doesn't exist or has expired. An unknown cache rejects.
+   */
+  async ttl(key) {
+    try {
+      const r = await this._client._cacheDo('GET', `${this._base}/keys/${esc(key)}`);
+      return r?.ttl_remaining ?? 0;
+    } catch (e) {
+      if (isMiss(e)) return -2;
+      throw e;
+    }
+  }
+
+  /**
+   * Set or update the TTL (seconds) of an existing key. Resolves false if the
+   * key doesn't exist; a non-positive ttl rejects (400).
+   */
+  async expire(key, ttl) {
+    try {
+      await this._client._cacheDo('POST', `${this._base}/keys/expire/${esc(key)}`, { ttl });
+      return true;
+    } catch (e) {
+      if (isMiss(e)) return false;
+      throw e;
+    }
+  }
+
+  /** Atomically set a key and return its old value, or null if it had none. */
+  async getSet(key, value, ttl = 0) {
+    const r = await this._client._cacheDo('POST', `${this._base}/keys/getset/${esc(key)}`, { value, ttl });
+    return r?.had_old ? r.old_value : null;
   }
 
   /** Delete a key. */
@@ -576,6 +625,7 @@ class ListRef {
   async lpop() { try { return (await this._c._cacheDo('POST', `${this._base}/lpop`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
   async rpop() { try { return (await this._c._cacheDo('POST', `${this._base}/rpop`))?.value; } catch(e) { if (isMiss(e)) return null; throw e; } }
   async range(start = 0, stop = -1) { return (await this._c._cacheDo('GET', `${this._base}?start=${start}&stop=${stop}`))?.values ?? []; }
+  async len() { return (await this._c._cacheDo('GET', `${this._base}?start=0&stop=-1`))?.length ?? 0; }
   async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
@@ -602,6 +652,14 @@ class HashRef {
   async getAll() { return (await this._c._cacheDo('GET', this._base))?.fields ?? {}; }
   async toJSON() { return (await this._c._cacheDo('GET', `${this._base}/json`))?.json ?? '{}'; }
   async fromJSON(jsonStr) { return this._c._cacheDo('PUT', `${this._base}/json`, { json: jsonStr }); }
+  /** Remove fields from the hash. Resolves to the number removed. */
+  async delFields(...fields) {
+    let removed = 0;
+    for (const field of fields) {
+      removed += (await this._c._cacheDo('DELETE', `${this._base}/fields/${esc(field)}`))?.removed ?? 0;
+    }
+    return removed;
+  }
   async del() { return this._c._cacheDo('DELETE', this._base); }
 }
 
@@ -615,6 +673,11 @@ class SortedSetRef {
   async score(member) { try { return (await this._c._cacheDo('GET', `${this._base}/score/${esc(member)}`))?.score; } catch(e) { if (isMiss(e)) return null; throw e; } }
   async rank(member) { try { return (await this._c._cacheDo('GET', `${this._base}/rank/${esc(member)}`))?.rank ?? -1; } catch(e) { if (isMiss(e)) return -1; throw e; } }
   async range(start = 0, stop = -1) { return (await this._c._cacheDo('GET', `${this._base}?start=${start}&stop=${stop}`))?.entries ?? []; }
+  /** Entries with scores between min and max (inclusive). */
+  async rangeByScore(min, max) {
+    const query = new URLSearchParams({ min: String(min), max: String(max) });
+    return (await this._c._cacheDo('GET', `${this._base}/byscore?${query}`))?.entries ?? [];
+  }
   async rem(...members) { return (await this._c._cacheDo('POST', `${this._base}/rem`, { members }))?.removed ?? 0; }
   async incrBy(member, delta) { return (await this._c._cacheDo('POST', `${this._base}/incrby`, { member, delta }))?.score ?? 0; }
   async del() { return this._c._cacheDo('DELETE', this._base); }
@@ -663,6 +726,16 @@ class PubSubRef {
   async createGroup(groupName) { return this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}`); }
   async claim(groupName, consumerId) { return (await this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/claim?consumer=${esc(consumerId)}`))?.message; }
   async ack(groupName, seq) { return this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/ack`, { seq }); }
+  /**
+   * Re-assign to consumerId the group's messages pending longer than
+   * timeoutSeconds without an ack, and resolve to them.
+   */
+  async reclaim(groupName, consumerId, timeoutSeconds = 30) {
+    const query = new URLSearchParams({ consumer: consumerId, timeout: String(timeoutSeconds) });
+    return (await this._c._cacheDo('POST', `${this._base}/group/${esc(groupName)}/reclaim?${query}`))?.messages ?? [];
+  }
+  /** Remove messages older than maxAgeSeconds. Resolves to the number removed; a non-positive age rejects (400). */
+  async trim(maxAgeSeconds) { return (await this._c._cacheDo('POST', `${this._base}/trim`, { max_age: maxAgeSeconds }))?.removed ?? 0; }
   async del() { return this._c._cacheDo('DELETE', this._base); }
   /** Describe the channel on the node asked: name, message_count, last_message_at, last_seq. */
   async info() { return this._c._cacheDo('GET', this._base); }
@@ -792,12 +865,14 @@ class PubSubWS {
    * @param {string} opts.token - Bearer token for authentication.
    * @param {number} [opts.reconnectInterval=2000] - Base reconnect interval in ms.
    * @param {number} [opts.maxReconnectInterval=30000] - Maximum reconnect interval cap in ms.
+   * @param {number} [opts.batchSize=50] - Messages the server reads per batch for a subscribe or watch.
    */
   constructor(opts) {
     this.url = opts.url;
     this.token = opts.token || '';
     this.reconnectInterval = opts.reconnectInterval || 2000;
     this.maxReconnectInterval = opts.maxReconnectInterval || 30000;
+    this.batchSize = opts.batchSize || 50;
 
     /** @private */
     this._ws = null;
@@ -855,15 +930,16 @@ class PubSubWS {
   _start(channel, sub) {
     this._subscriptions[channel] = sub;
     if (this._isConnected()) {
-      this._send(PubSubWS._request(channel, sub));
+      this._send(this._request(channel, sub));
     }
   }
 
   /** @private */
-  static _request(channel, sub) {
-    if (!sub.watch) return { action: 'subscribe', channel, consumer: sub.consumer };
-    if (sub.fromLatest) return { action: 'watch', channel, from_latest: true };
-    return { action: 'watch', channel, seq: sub.after };
+  _request(channel, sub) {
+    const count = this.batchSize;
+    if (!sub.watch) return { action: 'subscribe', channel, consumer: sub.consumer, count };
+    if (sub.fromLatest) return { action: 'watch', channel, from_latest: true, count };
+    return { action: 'watch', channel, seq: sub.after, count };
   }
 
   /**
@@ -953,7 +1029,7 @@ class PubSubWS {
       this._emit('connected');
 
       for (const channel in this._subscriptions) {
-        this._send(PubSubWS._request(channel, this._subscriptions[channel]));
+        this._send(this._request(channel, this._subscriptions[channel]));
       }
     });
 
