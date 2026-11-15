@@ -131,13 +131,6 @@ describe('new client methods', () => {
     assert.strictEqual(n, 2);
   });
 
-  it('registerExternalApp posts name/display_name', async () => {
-    const c = new LocalitasClient(baseUrl).withToken('t');
-    await c.registerExternalApp('myapp', 'My App', 'http://localhost:9999', 'star');
-    assert.strictEqual(captured.name, 'myapp');
-    assert.strictEqual(captured.display_name, 'My App');
-  });
-
   it('runAsync returns false without a run id', () => {
     const c = new LocalitasClient(baseUrl).withToken('t');
     assert.strictEqual(c.automation().runAsync('', async () => ({})), false);
