@@ -187,9 +187,20 @@ class LocalitasClient {
     return (result?.rows || []).map((r) => ({ name: r[0], url: r[1] }));
   }
 
-  /** Register this app into the platform app registry (app selector UI). */
-  async registerExternalApp(name, displayName, url, icon = '') {
-    return this._do('POST', '/apps/ext', { name, display_name: displayName, url, icon });
+  /**
+   * Register the app listening on port with core, so core proxies to it and
+   * runs its jobs. The app tells core only where it is
+   * (http://localhost:<port>); core reads the rest from its health.json,
+   * cron.json and public-paths.json. Returns at once and keeps trying in the
+   * background until core takes the app, since core reads the app while
+   * registering it. Call withdraw() on shutdown.
+   *
+   * In a container it does nothing: core registers app containers itself
+   * when Docker reports them healthy, and only core knows the port it
+   * published.
+   */
+  announce(port) {
+    return new Announcement(this, port);
   }
 
   // ── Permissions ────────────────────────────────────────────
@@ -400,6 +411,70 @@ class LocalitasClient {
       throw new Error(`${method} ${path}: response has no result envelope: ${JSON.stringify(r)}`);
     }
     return r.result;
+  }
+}
+
+const ANNOUNCE_RETRY_FIRST_MS = 1000;
+const ANNOUNCE_RETRY_MAX_MS = 30000;
+
+function inContainer() {
+  const fs = require('fs');
+  if (fs.existsSync('/.dockerenv')) return true;
+  try {
+    const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
+    return ['docker', 'containerd', 'kubepods'].some((k) => cgroup.includes(k));
+  } catch {
+    return false;
+  }
+}
+
+/** An app's registration with core, made by LocalitasClient.announce. */
+class Announcement {
+  constructor(client, port) {
+    this._client = client;
+    this._url = `http://localhost:${port}`;
+    this._name = '';
+    this._stopped = false;
+    this._settled = false;
+    this._wake = null;
+    this._done = inContainer() ? Promise.resolve() : this._run();
+    this._done.then(() => { this._settled = true; });
+  }
+
+  async _run() {
+    let wait = ANNOUNCE_RETRY_FIRST_MS;
+    while (!this._stopped) {
+      try {
+        const app = await this._client._do('POST', '/apps/ext', { url: this._url });
+        this._name = (app && app.name) || '';
+        console.log(`announced ${this._name} at ${this._url}`);
+        return;
+      } catch (e) {
+        console.warn(`core has not taken the app at ${this._url} yet; trying again in ${wait / 1000}s: ${e.message}`);
+      }
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, wait);
+        timer.unref();
+        this._wake = () => { clearTimeout(timer); resolve(); };
+      });
+      wait = Math.min(2 * wait, ANNOUNCE_RETRY_MAX_MS);
+    }
+  }
+
+  /** The app core registered, or '' while core has not taken it. */
+  get name() {
+    return this._settled ? this._name : '';
+  }
+
+  /** Stop announcing and take the app out of core, if core had taken it. */
+  async withdraw() {
+    this._stopped = true;
+    if (this._wake) this._wake();
+    await this._done;
+    if (this._name) {
+      await this._client._do('DELETE', `/apps/ext/${esc(this._name)}`);
+      this._name = '';
+    }
   }
 }
 
@@ -1122,7 +1197,7 @@ const scope = require('./scope');
 
 module.exports = {
   LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef,
-  QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, defaultToken,
+  QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, Announcement, defaultToken,
   AUTOMATION_RUN_ID_HEADER,
   Migrator: migrator.Migrator,
   crypto,
