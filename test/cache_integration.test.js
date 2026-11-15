@@ -4,7 +4,7 @@
  * Run: make integration-cluster-start && node test/cache_integration.test.js
  */
 
-const { LocalitasClient } = require('../src/index.js');
+const { LocalitasClient, APIError } = require('../src/index.js');
 const assert = require('assert');
 
 const INTEG_URL = 'http://localhost:9090';
@@ -85,6 +85,36 @@ async function main() {
     assert.strictEqual(keys.length, 2);
   }));
 
+  await test('getConsistent', () => withCache('kv', async (cache) => {
+    await cache.set('k', 'v');
+    assert.strictEqual(await cache.getConsistent('k'), 'v');
+    assert.strictEqual(await cache.getConsistent('absent'), null);
+  }));
+
+  await test('ttl and expire', () => withCache('kv', async (cache) => {
+    await cache.set('forever', 'v');
+    assert.strictEqual(await cache.ttl('forever'), -1);
+    assert.strictEqual(await cache.expire('forever', 300), true);
+    const left = await cache.ttl('forever');
+    assert.ok(left > 0 && left <= 300, `ttl ${left}`);
+    assert.strictEqual(await cache.ttl('absent'), -2);
+    assert.strictEqual(await cache.expire('absent', 300), false);
+    await assert.rejects(cache.expire('forever', 0), (e) => e instanceof APIError && e.statusCode === 400);
+  }));
+
+  await test('getSet', () => withCache('kv', async (cache) => {
+    assert.strictEqual(await cache.getSet('lock', 'owner-a'), null);
+    assert.strictEqual(await cache.getSet('lock', 'owner-b', 60), 'owner-a');
+    assert.strictEqual(await cache.get('lock'), 'owner-b');
+  }));
+
+  await test('an unknown cache is an error, not a miss', async () => {
+    const gone = makeClient().cache(uniqueName('gone'));
+    for (const call of [() => gone.get('k'), () => gone.ttl('k'), () => gone.expire('k', 10)]) {
+      await assert.rejects(call(), (e) => e instanceof APIError && e.statusCode === 404);
+    }
+  });
+
   // List
   await test('list push and range', () => withCache('list', async (cache) => {
     const lst = cache.list('q');
@@ -99,6 +129,13 @@ async function main() {
     await lst.rpush('a', 'b', 'c');
     assert.strictEqual(await lst.lpop(), 'a');
     assert.strictEqual(await lst.rpop(), 'c');
+  }));
+
+  await test('list len', () => withCache('list', async (cache) => {
+    const lst = cache.list('q');
+    assert.strictEqual(await lst.len(), 0);
+    await lst.rpush('a', 'b', 'c');
+    assert.strictEqual(await lst.len(), 3);
   }));
 
   // Set
@@ -127,6 +164,13 @@ async function main() {
     assert.strictEqual(parsed.name, 'Bob');
   }));
 
+  await test('hash delFields', () => withCache('hash', async (cache) => {
+    const h = cache.hash('user');
+    await h.set({ name: 'Alice', email: 'alice@test.com', city: 'NYC' });
+    assert.strictEqual(await h.delFields('email', 'city', 'missing'), 2);
+    assert.deepStrictEqual(await h.getAll(), { name: 'Alice' });
+  }));
+
   // Sorted Set
   await test('sorted set add and range', () => withCache('zset', async (cache) => {
     const lb = cache.sortedSet('lb');
@@ -141,6 +185,14 @@ async function main() {
     await lb.add(['alice', 100], ['bob', 200]);
     assert.strictEqual(await lb.score('alice'), 100);
     assert.strictEqual(await lb.rank('bob'), 1);
+  }));
+
+  await test('sorted set rangeByScore', () => withCache('zset', async (cache) => {
+    const lb = cache.sortedSet('lb');
+    await lb.add(['alice', 100], ['bob', 200], ['charlie', 50], ['dave', 150.5]);
+    const entries = await lb.rangeByScore(100, 150.5);
+    assert.deepStrictEqual(entries.map((e) => e.member), ['alice', 'dave']);
+    assert.deepStrictEqual(await lb.rangeByScore(1000, 2000), []);
   }));
 
   // Queue
@@ -189,6 +241,28 @@ async function main() {
     assert.ok(msg);
     assert.strictEqual(msg.value, 'job1');
     await ch.ack('workers', msg.seq);
+  }));
+
+  await test('pubsub reclaim', () => withCache('pubsub', async (cache) => {
+    const ch = cache.pubSub('jobs');
+    await ch.createGroup('workers');
+    await ch.publish('job1');
+    const msg = await ch.claim('workers', 'w1');
+    assert.deepStrictEqual(await ch.reclaim('workers', 'w2', 60), []);
+    // Claims are stamped in whole seconds; a zero timeout reclaims one made
+    // in an earlier second.
+    await new Promise((r) => setTimeout(r, 1100));
+    const reclaimed = await ch.reclaim('workers', 'w2', 0);
+    assert.deepStrictEqual(reclaimed.map((m) => [m.seq, m.value]), [[msg.seq, 'job1']]);
+  }));
+
+  await test('pubsub trim', () => withCache('pubsub', async (cache) => {
+    const ch = cache.pubSub('events');
+    await ch.publish('a');
+    await ch.publish('b');
+    assert.strictEqual(await ch.trim(3600), 0);
+    assert.strictEqual((await ch.info()).message_count, 2);
+    await assert.rejects(ch.trim(0), (e) => e instanceof APIError && e.statusCode === 400);
   }));
 
   // WebSocket tests
@@ -339,6 +413,22 @@ async function main() {
         assert.deepStrictEqual([msg.seq, msg.value], [fresh, 'new']);
         await new Promise((r) => setTimeout(r, 200));
         assert.strictEqual(seen.got.length, 1, 'the watch delivered more than what came next');
+      } finally {
+        ps.close();
+      }
+    }));
+
+    await test('subscribe in small batches delivers the whole backlog', () => withCache('watch', async (cache) => {
+      const ch = cache.pubSub('events');
+      const seqs = [];
+      for (let i = 0; i < 5; i++) seqs.push(await ch.publish(`m${i}`));
+
+      const ps = new PubSubWS({ url: `ws://localhost:9090/apps/cache/ws/${cache._name}`, token: INTEG_TOKEN, batchSize: 2 });
+      try {
+        const seen = collector();
+        ps.subscribe('events', 'batched', seen.add);
+        const delivered = await seen.next(5);
+        assert.deepStrictEqual(delivered.map((m) => m.seq), seqs);
       } finally {
         ps.close();
       }
