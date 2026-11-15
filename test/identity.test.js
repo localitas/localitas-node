@@ -30,14 +30,16 @@ function signHmac(apiToken, claims) {
 
 const fresh = (now, ttl = 300) => ({ user_id: 'u1', email: 'alice@test.local', permission: 'write', iat: now, exp: now + ttl, max: now + 86400 });
 
-function withEnv(values, fn) {
+const LEGACY_ENV = { LOCALITAS_API_TOKEN: TEST_API_TOKEN, LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS: 'true' };
+
+async function withEnv(values, fn) {
   const saved = {};
   for (const k of Object.keys(values)) {
     saved[k] = process.env[k];
     process.env[k] = values[k];
   }
   try {
-    return fn();
+    return await fn();
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
@@ -46,11 +48,13 @@ function withEnv(values, fn) {
   }
 }
 
+function assertLegacyRefused(token) {
+  assert.throws(() => scope.parseBearerToken(token, { now: T0 }), /legacy identity tokens are no longer accepted/);
+}
+
 describe('identity tokens', () => {
   beforeEach(() => {
-    scope.setIdentityKeyFromApiToken(TEST_API_TOKEN);
     scope.setIdentityPublicKeys(GOLDEN_PUBLIC_KEY);
-    scope.resetAcceptLegacyIdentityTokens();
   });
 
   it("verifies core's Ed25519 token", () => {
@@ -68,23 +72,29 @@ describe('identity tokens', () => {
     assert.throws(() => scope.parseBearerToken(signEd25519(0, fresh(T0)), { now: T0 }));
   });
 
-  it('accepts legacy tokens only while legacy tokens are accepted', () => {
-    const withExp = signHmac(TEST_API_TOKEN, fresh(T0));
-    scope.parseBearerToken(LEGACY_GOLDEN_TOKEN, { now: T0 });
-    scope.parseBearerToken(withExp, { now: T0 });
-    scope.setAcceptLegacyIdentityTokens(false);
-    for (const token of [LEGACY_GOLDEN_TOKEN, withExp]) {
-      assert.throws(() => scope.parseBearerToken(token, { now: T0 }), /legacy/);
-    }
-    scope.parseBearerToken(GOLDEN_TOKEN, { now: T0 });
+  it('refuses HMAC-signed tokens even when legacy acceptance is asked for', async () => {
+    await withEnv(LEGACY_ENV, () => {
+      assertLegacyRefused(LEGACY_GOLDEN_TOKEN);
+      assertLegacyRefused(signHmac(TEST_API_TOKEN, fresh(T0)));
+      assertLegacyRefused(signHmac(TEST_API_TOKEN, { ...fresh(T0), kid: 'hmac' }));
+      assertLegacyRefused(signHmac(TEST_API_TOKEN, { ...fresh(T0), permission: 'admin' }));
+    });
   });
 
-  it('takes the public key and policy from the environment', () => {
-    withEnv({ LOCALITAS_IDENTITY_PUBLIC_KEY: GOLDEN_PUBLIC_KEY, LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS: 'false' }, () => {
+  it('refuses a token without an expiry even when legacy acceptance is asked for', async () => {
+    const { exp, max, ...noExp } = fresh(T0);
+    await withEnv(LEGACY_ENV, () => {
+      assertLegacyRefused(signEd25519(7, noExp));
+      assertLegacyRefused(signEd25519(7, { ...noExp, exp: 0 }));
+    });
+    scope.parseBearerToken(signEd25519(7, fresh(T0)), { now: T0 });
+  });
+
+  it('takes the public key from the environment', async () => {
+    await withEnv({ ...LEGACY_ENV, LOCALITAS_IDENTITY_PUBLIC_KEY: GOLDEN_PUBLIC_KEY }, () => {
       scope.resetIdentityPublicKeys();
-      scope.resetAcceptLegacyIdentityTokens();
       scope.parseBearerToken(GOLDEN_TOKEN, { now: T0 });
-      assert.throws(() => scope.parseBearerToken(LEGACY_GOLDEN_TOKEN, { now: T0 }), /legacy/);
+      assertLegacyRefused(LEGACY_GOLDEN_TOKEN);
     });
   });
 });
@@ -100,7 +110,7 @@ describe('identity tokens with core', () => {
       const send = (body) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body)); };
       if (req.url === '/api/auth/identity/public-key') {
         state.askedKeyWith.push(auth);
-        return send({ alg: 'EdDSA', public_key: GOLDEN_PUBLIC_KEY, accept_legacy: false });
+        return send({ alg: 'EdDSA', public_key: GOLDEN_PUBLIC_KEY, accept_legacy: true });
       }
       if (req.url === '/api/auth/identity/refresh') {
         state.refreshes.push(auth);
@@ -122,17 +132,19 @@ describe('identity tokens with core', () => {
   beforeEach(() => {
     Object.assign(state, { seen: [], refreshes: [], askedKeyWith: [] });
     scope.setIdentityPublicKeys(GOLDEN_PUBLIC_KEY);
-    scope.resetAcceptLegacyIdentityTokens();
   });
   afterEach(() => scope.setIdentityPublicKeys(GOLDEN_PUBLIC_KEY));
 
-  it('loads the public key and policy from core', async () => {
-    await withEnv({ CORE_URL: url, LOCALITAS_API_TOKEN: TEST_API_TOKEN, LOCALITAS_IDENTITY_PUBLIC_KEY: '', LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS: '' }, async () => {
+  it('loads the public key from core and refuses legacy tokens though core says accept_legacy', async () => {
+    const { exp, max, ...noExp } = fresh(T0);
+    await withEnv({ ...LEGACY_ENV, CORE_URL: url, LOCALITAS_IDENTITY_PUBLIC_KEY: '' }, async () => {
       scope.resetIdentityPublicKeys();
       await scope.loadIdentityPublicKey();
       scope.parseBearerToken(GOLDEN_TOKEN, { now: T0 });
       assert.deepStrictEqual(state.askedKeyWith, [`Bearer ${TEST_API_TOKEN}`]);
-      assert.throws(() => scope.parseBearerToken(LEGACY_GOLDEN_TOKEN, { now: T0 }), /legacy/);
+      assertLegacyRefused(LEGACY_GOLDEN_TOKEN);
+      assertLegacyRefused(signHmac(TEST_API_TOKEN, fresh(T0)));
+      assertLegacyRefused(signEd25519(7, noExp));
     });
   });
 
