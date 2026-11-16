@@ -151,42 +151,6 @@ class LocalitasClient {
     return this._do('GET', path);
   }
 
-
-  // ── Service Registry ───────────────────────────────────────
-
-  async _serviceRegistryDb() {
-    const db = await this.createDatabase('service_registry', true);
-    await this.applyMigration(db.id, '20260424-000000-000-init', 'service registry table',
-      'CREATE TABLE IF NOT EXISTS services (name TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)',
-      'DROP TABLE IF EXISTS services');
-    return db.id;
-  }
-
-  /** Register a named service URL in the shared service registry. */
-  async registerService(name, url) {
-    const dbId = await this._serviceRegistryDb();
-    await this.sqlExec(dbId,
-      'INSERT INTO services (name, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at',
-      name, url, Math.floor(Date.now() / 1000));
-  }
-
-  /** Look up a service URL by name. Throws if not found. */
-  async discoverService(name) {
-    const dbId = await this._serviceRegistryDb();
-    const result = await this.sqlQuery(dbId, 'SELECT url FROM services WHERE name = ?', name);
-    if (!result?.rows?.length) {
-      throw new APIError('GET', `/services/${name}`, 404, `service ${name} not found`);
-    }
-    return result.rows[0][0];
-  }
-
-  /** List all registered services as [{ name, url }]. */
-  async listServices() {
-    const dbId = await this._serviceRegistryDb();
-    const result = await this.sqlQuery(dbId, 'SELECT name, url, updated_at FROM services ORDER BY name');
-    return (result?.rows || []).map((r) => ({ name: r[0], url: r[1] }));
-  }
-
   /**
    * Register the app listening on port with core, so core proxies to it and
    * runs its jobs. The app tells core only where it is
