@@ -861,16 +861,22 @@ class AutomationClient {
   /**
    * Return the run once it has finished, without polling it.
    *
-   * Every finished run is announced once on the completions channel, after
-   * its outcome is recorded. This notes the channel's last message, then
-   * reads the run; the read is linearizable, so a run whose completion is at
+   * Every finished run is announced once, after its outcome is recorded, on
+   * the channel its first read names (its owner's own completions channel;
+   * only the owner can read the run, so the caller is the owner), or on the
+   * shared 'completions' channel of a core that names none. This reads the
+   * run to learn the channel, notes the channel's last message, then reads
+   * the run again; the read is linearizable, so a run whose completion is at
    * or before the noted message is read finished. A run still going is
    * waited for by watching the channel after the noted message: its
    * completion comes after it, so it cannot be missed.
    */
   async waitForRun(runId, { timeout = 3600000 } = {}) {
-    const noted = await this._client.cache('localitas_automations').pubSub('completions').lastSeq();
-    const run = await this.getRun(runId);
+    let run = await this.getRun(runId);
+    if (run.status !== 'running' && run.status !== 'pending') return run;
+    const channel = run.completion_channel || 'completions';
+    const noted = await this._client.cache('localitas_automations').pubSub(channel).lastSeq();
+    run = await this.getRun(runId);
     if (run.status !== 'running' && run.status !== 'pending') return run;
 
     const baseUrl = this._client.baseUrl || '';
@@ -879,7 +885,7 @@ class AutomationClient {
     try {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`Timeout waiting for run ${runId}`)), timeout);
-        ps.watch('completions', noted, (msg) => {
+        ps.watch(channel, noted, (msg) => {
           let announced = {};
           try { announced = JSON.parse(msg.value || '{}'); } catch (_) { return; }
           if (announced.run_id === runId) {
