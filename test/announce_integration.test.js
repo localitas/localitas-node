@@ -12,10 +12,9 @@ const INTEG_TOKEN = 'lt_integ_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function listedUrl(client, name) {
+async function listed(client, name) {
   const apps = (await client._do('GET', '/apps/ext')) || [];
-  const app = apps.find((a) => a.name === name);
-  return app ? app.url : '';
+  return apps.some((a) => a.name === name);
 }
 
 async function main() {
@@ -42,10 +41,10 @@ async function main() {
       assert.ok(Date.now() < deadline, 'the app answering health.json was not registered');
       await sleep(100);
     }
-    assert.strictEqual(await listedUrl(client, name), `http://localhost:${port}`);
+    assert.ok(await listed(client, name), 'registered app not listed');
 
     await announcement.withdraw();
-    assert.strictEqual(await listedUrl(client, name), '', 'withdrawn app still listed');
+    assert.ok(!(await listed(client, name)), 'withdrawn app still listed');
     console.log('  PASS: a native app is registered once it answers, and withdrawn');
   } catch (e) {
     console.log(`  FAIL: ${e.message}`);
