@@ -873,11 +873,11 @@ class AutomationClient {
    */
   async waitForRun(runId, { timeout = 3600000 } = {}) {
     let run = await this.getRun(runId);
-    if (run.status !== 'running' && run.status !== 'pending') return run;
+    if (run.status === 'completed' || run.status === 'failed') return run;
     const channel = run.completion_channel || 'completions';
     const noted = await this._client.cache('localitas_automations').pubSub(channel).lastSeq();
     run = await this.getRun(runId);
-    if (run.status !== 'running' && run.status !== 'pending') return run;
+    if (run.status === 'completed' || run.status === 'failed') return run;
 
     const baseUrl = this._client.baseUrl || '';
     const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://') + '/apps/cache/ws/localitas_automations';
