@@ -974,6 +974,14 @@ class AutomationClient {
     this._client = client;
   }
 
+  /**
+   * Create an automation and return it.
+   * @param {CreateAutomationRequest|Object} request
+   */
+  async create(request) {
+    return this._client._do('POST', '/apps/automation/api/automations', request);
+  }
+
   /** Trigger an automation and return the run. */
   async trigger(automationId) {
     return this._client._do('POST', `/apps/automation/api/automations/${automationId}/trigger`);
@@ -1347,12 +1355,14 @@ const { Database } = require('./dbapi');
 const migrator = require('./migrator');
 const crypto = require('./crypto');
 const scope = require('./scope');
+const automation = require('./automation');
 
 module.exports = {
   LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef,
   QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, Announcement, defaultToken,
   AppRef, ConfigError, cacheSocketUrl, coreUrlFromEnv,
   AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER,
+  ...automation,
   Migrator: migrator.Migrator,
   crypto,
   scope,
