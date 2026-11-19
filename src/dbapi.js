@@ -17,7 +17,7 @@ class Statement {
   }
 
   async run(...params) {
-    const result = await this._db._client.sqlExec(this._db._dbId, this._sql, ...params);
+    const result = await this._db._client.sqlExec(await this._db._id(), this._sql, ...params);
     return {
       changes: result.rows_affected || 0,
       lastInsertRowid: result.last_insert_id || 0,
@@ -25,14 +25,14 @@ class Statement {
   }
 
   async get(...params) {
-    const result = await this._db._client.sqlQuery(this._db._dbId, this._sql, ...params);
+    const result = await this._db._client.sqlQuery(await this._db._id(), this._sql, ...params);
     this._lastColumns = result.columns || null;
     const objects = rowsToObjects(result.columns, result.rows);
     return objects.length > 0 ? objects[0] : undefined;
   }
 
   async all(...params) {
-    const result = await this._db._client.sqlQuery(this._db._dbId, this._sql, ...params);
+    const result = await this._db._client.sqlQuery(await this._db._id(), this._sql, ...params);
     this._lastColumns = result.columns || null;
     return rowsToObjects(result.columns, result.rows);
   }
@@ -43,17 +43,45 @@ class Statement {
   }
 }
 
+/**
+ * A database on core, used like better-sqlite3 but async. Get one by name
+ * with client.db(name); new Database(id, { host, token }) takes host from
+ * the argument, else CORE_URL, and never guesses one.
+ */
 class Database {
   constructor(dbId, opts = {}) {
-    const host = opts.host || 'localhost:8080';
-    const token = opts.token || '';
-    const protocol = host.startsWith('https') ? '' : 'http://';
-    const baseUrl = host.includes('://') ? host : `${protocol}${host}`;
     this._dbId = dbId;
+    this._name = opts.name || '';
+    this._resolving = null;
+    if (opts.client) {
+      this._client = opts.client;
+      return;
+    }
     // Resolved here, not at load: index.js requires this module before it
     // has exported LocalitasClient, so a load-time import is undefined.
-    const { LocalitasClient } = require('./index');
-    this._client = new LocalitasClient(baseUrl, token);
+    const { LocalitasClient, coreUrlFromEnv } = require('./index');
+    const host = opts.host || coreUrlFromEnv();
+    const baseUrl = host.includes('://') ? host : `http://${host}`;
+    this._client = new LocalitasClient(baseUrl, opts.token || '');
+  }
+
+  /** @private The database ID, resolved by name through core's idempotent
+   *  system-database call on first use; a failure is retried on the next. */
+  async _id() {
+    if (this._dbId) return this._dbId;
+    if (!this._resolving) {
+      this._resolving = this._client.createDatabase(this._name, true).then(
+        (db) => {
+          this._dbId = db.id;
+          return db.id;
+        },
+        (err) => {
+          this._resolving = null;
+          throw err;
+        },
+      );
+    }
+    return this._resolving;
   }
 
   prepare(sql) {
@@ -61,11 +89,11 @@ class Database {
   }
 
   async exec(sql) {
-    return this._client.sqlExec(this._dbId, sql);
+    return this._client.sqlExec(await this._id(), sql);
   }
 
   async pragma(sql) {
-    return this._client.sqlQuery(this._dbId, `PRAGMA ${sql}`);
+    return this._client.sqlQuery(await this._id(), `PRAGMA ${sql}`);
   }
 
   transaction(fn) {
@@ -90,7 +118,7 @@ class Database {
       }
 
       if (statements.length === 0) return;
-      return db._client.sqlTransaction(db._dbId, statements);
+      return db._client.sqlTransaction(await db._id(), statements);
     };
   }
 

@@ -47,11 +47,12 @@ function resetIdentityPublicKeys() {
 
 /** Ask core (CORE_URL, with LOCALITAS_API_TOKEN) for its identity public key.
  *  An app running on the host, without LOCALITAS_IDENTITY_PUBLIC_KEY, awaits
- *  this once at startup. */
+ *  this once at startup. Without CORE_URL it asks nothing and rejects with a
+ *  ConfigError, as it rejects when core is unreachable. */
 async function loadIdentityPublicKey() {
-  const { defaultToken } = require('./index');
-  const token = process.env.LOCALITAS_API_TOKEN || defaultToken();
-  const base = (process.env.CORE_URL || 'http://localhost:8080').replace(/\/+$/, '');
+  const { defaultToken, coreUrlFromEnv } = require('./index');
+  const base = coreUrlFromEnv();
+  const token = defaultToken();
   const resp = await fetch(base + '/api/auth/identity/public-key', { headers: { Authorization: `Bearer ${token}` } });
   if (!resp.ok) throw new Error(`identity public key: ${resp.status}`);
   const body = await resp.json();
