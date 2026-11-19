@@ -235,6 +235,8 @@ describe('client.db', () => {
     ]);
     assert.deepStrictEqual(core.calls[0].body, { name: 'notes' });
     assert.deepStrictEqual(core.calls[2].body, { sql: 'INSERT INTO notes (title) VALUES (?)', args: ['second'] });
+    assert.strictEqual(await db.databaseId(), 'db_7');
+    assert.strictEqual(db.client.baseUrl, core.url);
   });
 
   it('raises a failed resolution from the use and retries it on the next', async () => {

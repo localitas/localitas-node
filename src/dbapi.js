@@ -84,6 +84,16 @@ class Database {
     return this._resolving;
   }
 
+  /** The client this database is reached through. */
+  get client() {
+    return this._client;
+  }
+
+  /** The database's ID, resolved by name on first use (see db(name)). */
+  async databaseId() {
+    return this._id();
+  }
+
   prepare(sql) {
     return new Statement(this, sql);
   }
