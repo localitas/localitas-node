@@ -3,10 +3,13 @@
  *
  * Usage:
  *   const { LocalitasClient } = require('@localitas/client');
- *   const client = new LocalitasClient('http://localhost:8090');
- *   const authed = client.withToken(bearerToken);
- *   const databases = await authed.listDatabases();
+ *   const client = LocalitasClient.default();
+ *   const notes = client.db('notes');
+ *   const forecast = await client.app('weather').get('/api/forecast');
+ *   client.cache('events').subscribe('orders', 'worker-1', (msg) => console.log(msg.value));
  */
+
+const { checkAppName, checkAppPath } = require('./address');
 
 // Header the platform sets on automation-triggered HTTP calls; carries the run
 // ID a handler publishes its async result back to (see AutomationClient.runAsync).
@@ -25,12 +28,62 @@ class APIError extends Error {
   }
 }
 
+/** A client is missing configuration it cannot guess, such as CORE_URL. */
+class ConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+const CORE_URL_UNSET = 'CORE_URL is not set: core sets it for every app it runs; outside core pass the URL to the constructor';
+
+/** CORE_URL without trailing slashes; a ConfigError when unset or not an absolute http(s) URL. */
+function coreUrlFromEnv() {
+  const raw = (process.env.CORE_URL || '').trim();
+  if (!raw) throw new ConfigError(CORE_URL_UNSET);
+  let parsed = null;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    parsed = null;
+  }
+  if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.host) {
+    throw new ConfigError(`CORE_URL ${JSON.stringify(raw)} is not an absolute http(s) URL`);
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+/** The WebSocket URL of a cache's pub/sub socket on core at baseUrl: ws for
+ *  http, wss for https. Every socket the SDK opens is built here. */
+function cacheSocketUrl(baseUrl, cache) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  if (!base) throw new ConfigError(CORE_URL_UNSET);
+  const scheme = base.startsWith('https://') ? 'wss://' : 'ws://';
+  return scheme + base.replace(/^https?:\/\//, '') + `/apps/cache/ws/${esc(cache)}`;
+}
+
 class LocalitasClient {
-  constructor(baseUrl, token = '') {
-    this.baseUrl = baseUrl.replace(/\/+$/, '');
+  constructor(baseUrl = '', token = '') {
+    this.baseUrl = String(baseUrl || '').replace(/\/+$/, '');
     this.token = token;
     /** Unix seconds now; identity tokens are refreshed against it. */
     this.now = () => Date.now() / 1000;
+  }
+
+  /** The client of an app core runs: core at CORE_URL, acting with
+   *  LOCALITAS_API_TOKEN. Throws a ConfigError naming whichever is missing. */
+  static default() {
+    const baseUrl = coreUrlFromEnv();
+    const token = process.env.LOCALITAS_API_TOKEN || '';
+    if (!token) throw new ConfigError('LOCALITAS_API_TOKEN is not set: core sets it for every app it runs; outside core pass the token to the constructor');
+    return new LocalitasClient(baseUrl, token);
+  }
+
+  /** baseUrl + path; a ConfigError for a client without a base URL. */
+  _url(path) {
+    if (!this.baseUrl) throw new ConfigError(CORE_URL_UNSET);
+    return this.baseUrl + path;
   }
 
   /** The token to send. An identity token within a minute of its expiry is
@@ -45,7 +98,7 @@ class LocalitasClient {
     const max = Number(claims.max || 0);
     if (exp && max > exp && exp - this.now() < REFRESH_BEFORE_SECONDS) {
       try {
-        const resp = await fetch(this.baseUrl + '/api/auth/identity/refresh', {
+        const resp = await fetch(this._url('/api/auth/identity/refresh'), {
           method: 'POST', headers: { Authorization: `Bearer ${this.token}` },
         });
         if (resp.ok) {
@@ -70,6 +123,28 @@ class LocalitasClient {
 
   withToken(token) {
     return new LocalitasClient(this.baseUrl, token);
+  }
+
+  /**
+   * Call another app by name: its endpoints are at /apps/ext/<name> on core,
+   * whichever node runs it.
+   * @param {string} name - The app's name.
+   * @returns {AppRef}
+   */
+  app(name) {
+    return new AppRef(this, checkAppName(name));
+  }
+
+  /**
+   * The app's system database named name, as a Database. Its ID is resolved
+   * on first use (and retried on the next use after a failure), so an app
+   * started while core's data shard elects does not fail here.
+   * @param {string} name - The database's name.
+   * @returns {Database}
+   */
+  db(name) {
+    if (typeof name !== 'string' || !name) throw new TypeError('db name must be a non-empty string');
+    return new Database(null, { client: this, name });
   }
 
   // ── Databases ──────────────────────────────────────────────
@@ -164,8 +239,8 @@ class LocalitasClient {
 
   /**
    * Register the app listening on port with core, so core proxies to it and
-   * runs its jobs. The app tells core only where it is
-   * (http://localhost:<port>); core reads the rest from its health.json,
+   * runs its jobs. The app tells core only where it is (that port on its own
+   * host); core reads the rest from its health.json,
    * cron.json and public-paths.json. Returns at once and keeps trying in the
    * background until core takes the app, since core reads the app while
    * registering it. Call withdraw() on shutdown.
@@ -306,7 +381,7 @@ class LocalitasClient {
     const headers = { 'Content-Type': 'text/plain' };
     const bearer = await this._bearer();
     if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
-    const resp = await fetch(this.baseUrl + '/apps/tsdb/api/ingest', {
+    const resp = await fetch(this._url('/apps/tsdb/api/ingest'), {
       method: 'POST', headers, body: lines,
     });
     const text = await resp.text();
@@ -354,7 +429,7 @@ class LocalitasClient {
   // ── Transport ──────────────────────────────────────────────
 
   async _do(method, path, body = null) {
-    const url = this.baseUrl + path;
+    const url = this._url(path);
     const opts = {
       method,
       headers: {},
@@ -453,6 +528,29 @@ class Announcement {
   }
 }
 
+/**
+ * Another app's endpoints, by the app's name: each call goes to
+ * /apps/ext/<name><path> on core with the client's token, sends body as
+ * JSON and resolves to the decoded JSON (null for an empty body). An error
+ * status rejects with APIError; a path that is not a path rejects with
+ * TypeError.
+ */
+class AppRef {
+  constructor(client, name) {
+    this._client = client;
+    this.name = name;
+  }
+
+  async get(path) { return this._call('GET', path); }
+  async post(path, body = null) { return this._call('POST', path, body); }
+  async put(path, body = null) { return this._call('PUT', path, body); }
+  async delete(path) { return this._call('DELETE', path); }
+
+  async _call(method, path, body = null) {
+    return this._client._do(method, `/apps/ext/${this.name}${checkAppPath(path)}`, body);
+  }
+}
+
 function esc(s) {
   return encodeURIComponent(String(s));
 }
@@ -472,10 +570,12 @@ function isMiss(e) {
 }
 
 /**
- * Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
- * Returns empty string if not found.
+ * Deprecated: use LocalitasClient.default(). The API token from
+ * LOCALITAS_API_TOKEN, else ~/.localitas/config-core.yaml
+ * (core.auth.api_token); '' if neither has one.
  */
 function defaultToken() {
+  if (process.env.LOCALITAS_API_TOKEN) return process.env.LOCALITAS_API_TOKEN;
   const fs = require('fs');
   const path = require('path');
   const home = require('os').homedir();
@@ -532,12 +632,57 @@ function defaultToken() {
  *   const ch = cache.pubSub('notifications', { maxSize: 1000, maxAgeSeconds: 1209600 });
  *   await ch.publish('{"type":"signup"}');
  *   const msgs = await ch.read('audit-svc', 50);
+ *
+ *   // Real-time delivery over the cache's socket
+ *   const socket = cache.subscribe('notifications', 'worker-1', (msg) => console.log(msg.value));
  */
 class CacheRef {
   constructor(client, name) {
     this._client = client;
     this._name = name;
     this._base = `/apps/cache/api/caches/${esc(name)}`;
+    this._ws = null;
+  }
+
+  // ── Real-time ──────────────────────────────────────────────
+
+  /**
+   * PubSubWS.subscribe on this cache's socket, opened on first use from the
+   * client's base URL and token and shared by later calls on this ref.
+   * @returns {PubSubWS} the socket, to close() or listen on.
+   */
+  subscribe(channel, consumer, callback) {
+    const ws = this._socket();
+    ws.subscribe(channel, consumer, callback);
+    return ws;
+  }
+
+  /**
+   * PubSubWS.watch on this cache's socket (see subscribe).
+   * @returns {PubSubWS}
+   */
+  watch(channel, afterSeq, callback) {
+    const ws = this._socket();
+    ws.watch(channel, afterSeq, callback);
+    return ws;
+  }
+
+  /**
+   * PubSubWS.watchLatest on this cache's socket (see subscribe).
+   * @returns {PubSubWS}
+   */
+  watchLatest(channel, callback) {
+    const ws = this._socket();
+    ws.watchLatest(channel, callback);
+    return ws;
+  }
+
+  /** @private */
+  _socket() {
+    if (!this._ws || this._ws._intentionalClose) {
+      this._ws = new PubSubWS({ url: cacheSocketUrl(this._client.baseUrl, this._name), token: this._client.token });
+    }
+    return this._ws;
   }
 
   // ── KV ─────────────────────────────────────────────────────
@@ -799,29 +944,42 @@ class PubSubRef {
 
 const WebSocket = require('ws');
 
-/**
- * WebSocket-based real-time pub/sub client for Localitas DurablePubSub.
- *
- * Provides automatic reconnection with exponential backoff, cursor-based
- * message delivery (no missed messages), and consumer group support.
- *
- * @example
- *   const { PubSubWS } = require('@localitas/client');
- *   const pubsub = new PubSubWS({
- *     url: 'ws://localhost:8080/apps/cache/ws/my-cache',
- *     token: 'your-api-token',
- *   });
- *
- *   pubsub.subscribe('notifications', 'worker-1', (msg) => {
- *     console.log('Got:', msg.value);
- *   });
- *
- *   pubsub.publish('events', '{"type":"click"}');
- *   pubsub.on('connected', () => console.log('connected'));
- */
+const IDEMPOTENCY_KEY_HEADER = 'Idempotency-Key';
+
+function headerValue(headers, name) {
+  if (typeof headers.get === 'function') return headers.get(name) || '';
+  const want = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== want) continue;
+    const v = headers[key];
+    return String((Array.isArray(v) ? v[0] : v) ?? '');
+  }
+  return '';
+}
+
+/** The run ID and Idempotency-Key of an automation's async call, from the
+ *  run ID itself, an incoming request (its .headers) or its headers. */
+function asyncCall(runIdOrReq) {
+  if (!runIdOrReq) return { runId: '', idempotencyKey: '' };
+  if (typeof runIdOrReq === 'string') return { runId: runIdOrReq, idempotencyKey: '' };
+  const headers = runIdOrReq.headers && typeof runIdOrReq.headers === 'object' ? runIdOrReq.headers : runIdOrReq;
+  return {
+    runId: headerValue(headers, AUTOMATION_RUN_ID_HEADER),
+    idempotencyKey: headerValue(headers, IDEMPOTENCY_KEY_HEADER),
+  };
+}
+
 class AutomationClient {
   constructor(client) {
     this._client = client;
+  }
+
+  /**
+   * Create an automation and return it.
+   * @param {CreateAutomationRequest|Object} request
+   */
+  async create(request) {
+    return this._client._do('POST', '/apps/automation/api/automations', request);
   }
 
   /** Trigger an automation and return the run. */
@@ -834,22 +992,32 @@ class AutomationClient {
     return this._client._do('GET', `/apps/automation/api/runs/${runId}`);
   }
 
-  /** Signal async job completion. Called from inside the background job. */
-  async publishResult(runId, status = 'completed', result = {}, error = '') {
-    return this._client._do('POST', `/apps/automation/api/runs/${runId}/complete`, { status, result, error });
+  /**
+   * Signal async job completion. Called from inside the background job.
+   * idempotencyKey, the Idempotency-Key of the call this completes, restricts
+   * the completion to that try.
+   */
+  async publishResult(runId, status = 'completed', result = {}, error = '', { idempotencyKey = '' } = {}) {
+    const body = { status, result, error };
+    if (idempotencyKey) body.idempotency_key = idempotencyKey;
+    return this._client._do('POST', `/apps/automation/api/runs/${runId}/complete`, body);
   }
 
   /**
    * Run ``work`` in the background and publish its result back to the automation
    * run when done. ``work`` is an async function returning an object (or null).
-   * Returns true if a runId was supplied (so the handler should respond 202
-   * immediately), false otherwise — mirroring the Go RunAsync pattern. Extract
-   * runId from the request's AUTOMATION_RUN_ID_HEADER header before calling.
-   * @param {string} runId
+   * Pass the incoming request (or its headers): the run ID comes from its
+   * Localitas-Automation-Run-ID header and its Idempotency-Key is echoed, so
+   * the completion ends only the try that made the call. A run ID string
+   * still works and completes the run's running tasks.
+   * Returns true if the call was an automation's (so the handler should
+   * respond 202 immediately), false otherwise — mirroring the Go RunAsync pattern.
+   * @param {string|{headers: Object}|Headers|Object} runIdOrReq
    * @param {() => Promise<object|null>} work
    * @returns {boolean}
    */
-  runAsync(runId, work) {
+  runAsync(runIdOrReq, work) {
+    const { runId, idempotencyKey } = asyncCall(runIdOrReq);
     if (!runId) return false;
     (async () => {
       const start = Date.now();
@@ -864,7 +1032,7 @@ class AutomationClient {
       }
       if (result === null || result === undefined) result = {};
       result.duration_ms = Date.now() - start;
-      await this.publishResult(runId, status, result, error);
+      await this.publishResult(runId, status, result, error, { idempotencyKey });
     })();
     return true;
   }
@@ -890,9 +1058,7 @@ class AutomationClient {
     run = await this.getRun(runId);
     if (run.status === 'completed' || run.status === 'failed') return run;
 
-    const baseUrl = this._client.baseUrl || '';
-    const wsUrl = baseUrl.replace('http://', 'ws://').replace('https://', 'wss://') + '/apps/cache/ws/localitas_automations';
-    const ps = new PubSubWS({ url: wsUrl, token: this._client.token });
+    const ps = new PubSubWS({ url: cacheSocketUrl(this._client.baseUrl, 'localitas_automations'), token: this._client.token });
     try {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`Timeout waiting for run ${runId}`)), timeout);
@@ -912,6 +1078,20 @@ class AutomationClient {
   }
 }
 
+/**
+ * WebSocket-based real-time pub/sub client for Localitas DurablePubSub.
+ *
+ * Provides automatic reconnection with exponential backoff, cursor-based
+ * message delivery (no missed messages), and consumer group support. Open
+ * one through a cache, which builds its URL from the client's:
+ *
+ * @example
+ *   const pubsub = LocalitasClient.default().cache('my-cache')
+ *     .subscribe('notifications', 'worker-1', (msg) => console.log('Got:', msg.value));
+ *
+ *   pubsub.publish('events', '{"type":"click"}');
+ *   pubsub.on('connected', () => console.log('connected'));
+ */
 class PubSubWS {
   /**
    * Create a new PubSubWS client. Connects automatically.
@@ -1175,11 +1355,14 @@ const { Database } = require('./dbapi');
 const migrator = require('./migrator');
 const crypto = require('./crypto');
 const scope = require('./scope');
+const automation = require('./automation');
 
 module.exports = {
   LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef,
   QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, Announcement, defaultToken,
-  AUTOMATION_RUN_ID_HEADER,
+  AppRef, ConfigError, cacheSocketUrl, coreUrlFromEnv,
+  AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER,
+  ...automation,
   Migrator: migrator.Migrator,
   crypto,
   scope,
