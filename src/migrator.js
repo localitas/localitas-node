@@ -14,14 +14,17 @@ const path = require('path');
 
 const TIMESTAMP_RE = /^(\d{8})-(\d{6})-(\d{3})-(.+)\.sql$/;
 const LEGACY_RE = /^(\d+)_(.+)\.sql$/;
+const VERSION_RECORDED = 'SELECT 1 FROM schema_migrations WHERE version = ?';
 
 class Migrator {
   /**
    * @param {string} migrationsDir - directory of .sql files
    * @param {(sql: string, ...args) => Promise<any>} execSql - e.g. (s,...a) => client.sqlExec(dbId, s, ...a)
    * @param {(sql: string, ...args) => Promise<any>} querySql - e.g. (s,...a) => client.sqlQuery(dbId, s, ...a)
-   * @param {(stmts: {sql: string, args: any[]}[]) => Promise<any>} execTx - applies the statements as one
-   *   transaction, e.g. (stmts) => client.sqlTransaction(dbId, stmts)
+   * @param {(stmts: {sql: string, args: any[]}[], unlessExists: {sql: string, args: any[]}) => Promise<{skipped?: boolean}>} execTx
+   *   - applies the statements as one transaction unless the query unlessExists returns a row, and
+   *   resolves to a result whose `skipped` is true when it applied nothing for that reason, e.g.
+   *   (stmts, unless) => client.sqlTransaction(dbId, stmts, unless). See Migrator.forDatabase.
    */
   constructor(migrationsDir, execSql, querySql, execTx) {
     this._exec = execSql;
@@ -30,10 +33,24 @@ class Migrator {
     this._migrations = loadMigrations(migrationsDir);
   }
 
+  /** A Migrator for database `dbId` through `client` (a LocalitasClient):
+   *  each migration is one conditional transaction. */
+  static forDatabase(migrationsDir, client, dbId) {
+    return new Migrator(
+      migrationsDir,
+      (sql, ...args) => client.sqlExec(dbId, sql, ...args),
+      (sql, ...args) => client.sqlQuery(dbId, sql, ...args),
+      (stmts, unlessExists) => client.sqlTransaction(dbId, stmts, unlessExists),
+    );
+  }
+
   /** Apply every pending migration. Each is one transaction that records its
    *  version before its statements, so it applies whole or not at all, and of
-   *  several instances migrating at once exactly one applies it: the others'
-   *  transactions fail on the version's primary key. */
+   *  several instances migrating at once exactly one applies it. The
+   *  transaction is conditional on the version not being recorded yet: core
+   *  skips the others' transactions, which leaves no failed write in its
+   *  replicated log. A core without conditional transactions fails them on
+   *  the version's primary key instead, which is handled the same way. */
   async run() {
     await this._exec(
       'CREATE TABLE IF NOT EXISTS schema_migrations (' +
@@ -46,9 +63,14 @@ class Migrator {
     for (const m of this._migrations) {
       if (applied.has(m.version)) continue;
       try {
-        await this._apply(m);
+        if (await this._apply(m)) {
+          console.info(`migration ${m.version}_${m.name} was applied by another node`);
+        }
       } catch (err) {
-        if (isVersionTaken(err)) continue;
+        if (isVersionTaken(err)) {
+          console.info(`migration ${m.version}_${m.name} was applied by another node`);
+          continue;
+        }
         if (!isIdempotentError(err)) throw err;
         // The schema change is in place without its version row (a database
         // migrated before migrations were atomic).
@@ -57,14 +79,17 @@ class Migrator {
     }
   }
 
+  /** Apply one migration; resolves true when it was skipped because its
+   *  version was already recorded. */
   async _apply(m) {
-    await this._execTx([
+    const result = await this._execTx([
       {
         sql: 'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
         args: [m.version, m.name, Math.floor(Date.now() / 1000)],
       },
       ...splitSql(m.sql).map((sql) => ({ sql, args: [] })),
-    ]);
+    ], { sql: VERSION_RECORDED, args: [m.version] });
+    return Boolean(result && result.skipped);
   }
 
   async _repair(m) {

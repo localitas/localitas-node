@@ -139,8 +139,19 @@ class LocalitasClient {
     return this._do('POST', `/apps/data/api/databases/${esc(dbId)}/query`, { sql, args });
   }
 
-  async sqlTransaction(dbId, statements) {
-    return this._do('POST', `/apps/data/api/databases/${esc(dbId)}/exec`, { statements });
+  /**
+   * Apply statements ({sql, args}) as one atomic transaction. `unlessExists`
+   * ({sql, args}) makes it conditional: core runs that read-only query inside
+   * the replicated transaction, on the state every node holds at its place in
+   * the log, and applies nothing when it returns a row. The result then has
+   * `skipped: true` — a success, not an error — so of writers racing on one
+   * condition exactly one applies. Core refuses a query that is not one
+   * read-only SELECT, WITH or VALUES statement.
+   */
+  async sqlTransaction(dbId, statements, unlessExists) {
+    const body = { statements };
+    if (unlessExists) body.unless_exists = unlessExists;
+    return this._do('POST', `/apps/data/api/databases/${esc(dbId)}/exec`, body);
   }
 
   // ── Search ─────────────────────────────────────────────────
