@@ -19,22 +19,30 @@ function writeMigrations(files) {
 }
 
 // A Migrator whose callables run on their own connection to a real SQLite file.
-function sqliteMigrator(dir, dbPath) {
+// Its transactions honour unlessExists as core does: the query runs inside the
+// transaction, first, and a row means nothing applies. conditional = false
+// ignores it, as a core without conditional transactions would.
+function sqliteMigrator(dir, dbPath, conditional = true) {
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA busy_timeout = 10000');
   const migrator = new Migrator(
     dir,
     async (sql, ...args) => db.prepare(sql).run(...args),
     async (sql, ...args) => ({ rows: db.prepare(sql).all(...args).map((r) => Object.values(r)) }),
-    async (stmts) => {
+    async (stmts, unlessExists) => {
       db.exec('BEGIN IMMEDIATE');
       try {
+        if (conditional && db.prepare(unlessExists.sql).get(...unlessExists.args) !== undefined) {
+          db.exec('ROLLBACK');
+          return { skipped: true };
+        }
         for (const s of stmts) db.prepare(s.sql).run(...s.args);
       } catch (err) {
         db.exec('ROLLBACK');
         throw err;
       }
       db.exec('COMMIT');
+      return { rows_affected: stmts.length };
     },
   );
   return { migrator, db };
@@ -64,10 +72,20 @@ describe('Migrator', () => {
       ['20260101-000000-000', '20260102-000000-000', '20260103-000000-000']);
   });
 
-  it('a stale instance does not reapply a migration another applied', async () => {
+  it('a stale instance is skipped on a migration another applied', async () => {
     const dir = writeMigrations(SEED);
     await sqliteMigrator(dir, dbPath).migrator.run();
     const stale = sqliteMigrator(dir, dbPath).migrator;
+    for (const m of stale._migrations) {
+      assert.strictEqual(await stale._apply(m), true, `${m.version} must be skipped, not failed`);
+    }
+    assert.deepStrictEqual(column(dbPath, 'SELECT name FROM items'), ['default']);
+  });
+
+  it('a stale instance on a core without conditions does not reapply', async () => {
+    const dir = writeMigrations(SEED);
+    await sqliteMigrator(dir, dbPath).migrator.run();
+    const stale = sqliteMigrator(dir, dbPath, false).migrator;
     for (const m of stale._migrations) {
       await assert.rejects(stale._apply(m), /UNIQUE constraint failed: schema_migrations.version/);
     }

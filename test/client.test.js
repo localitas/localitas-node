@@ -6,6 +6,7 @@ const assert = require('node:assert');
 let server;
 let baseUrl;
 let capturedAuth = null;
+let capturedUnlessExists = null;
 
 const routes = {
   'GET /apps/data/api/databases': (req, body) => {
@@ -24,6 +25,10 @@ const routes = {
     return [200, { columns: ['id', 'name'], rows: [[1, 'Alice'], [2, 'Bob']] }];
   },
   'POST /apps/data/api/databases/db1/exec': (req, body) => {
+    if (body && body.unless_exists) {
+      capturedUnlessExists = body.unless_exists;
+      return [200, { rows_affected: 0, skipped: true }];
+    }
     if (body && body.statements) {
       return [200, { rows_affected: body.statements.length }];
     }
@@ -125,6 +130,14 @@ describe('LocalitasClient', () => {
       { sql: 'INSERT INTO b VALUES (?)', args: [2] },
     ]);
     assert.strictEqual(result.rows_affected, 2);
+  });
+
+  it('sqlTransaction unless a query finds a row', async () => {
+    const client = new LocalitasClient(baseUrl);
+    const unlessExists = { sql: 'SELECT 1 FROM a WHERE v = ?', args: [1] };
+    const result = await client.sqlTransaction('db1', [{ sql: 'INSERT INTO a VALUES (?)', args: [1] }], unlessExists);
+    assert.strictEqual(result.skipped, true);
+    assert.deepStrictEqual(capturedUnlessExists, unlessExists);
   });
 
   it('searchFts', async () => {
