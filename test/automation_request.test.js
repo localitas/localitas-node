@@ -40,8 +40,11 @@ function nightlySync() {
           { dependencies: ['fetch'], dependsOnPast: true, triggerRule: 'all_done' }),
         sensorNode('wait_time', 'any_node', timeSensor('15m'), { dependencies: ['fetch'] }),
         sensorNode('wait_file', 'all_nodes', fileSensor(['/Documents/inbox']), { dependencies: ['fetch'] }),
+        sensorNode('wait_paid', 'any_node',
+          pubsubSensor('orders', { match: { status: 'paid', 'order.total': 100 }, cache: 'localitas_automations', timeout: '2h' }),
+          { dependencies: ['fetch'], priorityWeight: 10 }),
         httpNode('report', 'any_node', new HTTPSettings({ url: 'https://example.com/hook', body: { ok: true } }),
-          { dependencies: ['wait_event', 'wait_time', 'wait_file'], triggerRule: 'one_success' }),
+          { dependencies: ['wait_event', 'wait_time', 'wait_file', 'wait_paid'], triggerRule: 'one_success' }),
       ],
     }),
   });
