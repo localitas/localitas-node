@@ -96,7 +96,8 @@ class FakeCore {
       req.resume();
       if (status === 201) return this._send(res, 201, { name: 'app' });
       if (status === 503) return this._send(res, 503, { error: 'node not ready: serving' }, { 'Retry-After': '1', 'X-Localitas-Not-Ready': 'serving' });
-      return this._send(res, status, { error: 'health.json: connection refused' });
+      if (status === 502) return this._send(res, 502, { error: 'health.json: connection refused: the app does not answer health.json' });
+      return this._send(res, status, { error: 'health.json names no app' });
     }
     if (route === 'DELETE /apps/ext/app') return this._send(res, 204, null);
     this._send(res, 404, { error: 'not found' });
@@ -152,8 +153,20 @@ test('a registration core answers 503 waits again, then registers once', async (
   assert.deepStrictEqual([core.posts, core.asks.length], [2, 2]);
 });
 
-test('a registration core refuses otherwise is not retried', async (t) => {
+test('an app core cannot reach yet (502) is asked again, then registers once', async (t) => {
   const core = new FakeCore([502]);
+  core.ready = true;
+  const announcement = await started(t, core);
+
+  assert.deepStrictEqual([await core.next(), await core.next(), await core.next(), await core.next()], ['ready', 'post', 'ready', 'post'],
+    'core found the app not answering yet (502) and the app did not register once it answered');
+  await ended(announcement);
+  assert.strictEqual(announcement.name, 'app');
+  assert.strictEqual(core.posts, 2);
+});
+
+test('a registration core refuses otherwise is not retried', async (t) => {
+  const core = new FakeCore([422]);
   core.ready = true;
   const announcement = await started(t, core);
 

@@ -257,8 +257,9 @@ class LocalitasClient {
    * cron.json and public-paths.json. Returns at once and, in the background,
    * waits until core is ready (waitReady) and registers the app once, since
    * core reads the app while registering it. A registration core answers 503
-   * (not ready: it restarted) waits again; any other failure is logged as an
-   * error and not tried again. Call withdraw() on shutdown.
+   * (not ready: it restarted) waits again; one it answers 502 (the app does
+   * not answer yet) is asked again after a bounded backoff; any other failure
+   * is logged as an error and not tried again. Call withdraw() on shutdown.
    *
    * In a container it does nothing: core registers app containers itself
    * when Docker reports them healthy, and only core knows the port it
@@ -537,6 +538,12 @@ function coreDown(e) {
   return ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(code);
 }
 
+/** Whether core could not take the app because the app did not answer it
+ *  yet (502): its port closed, or health.json not served yet. */
+function appNotAnswering(e) {
+  return e instanceof APIError && e.statusCode === 502;
+}
+
 /** Whether a call failed because core could not take it yet: it answered
  *  503 (not ready), or its process is not there. */
 function notReady(e) {
@@ -579,6 +586,7 @@ class Announcement {
 
   async _run() {
     const { signal } = this._stop;
+    let redial = REDIAL_FIRST_MS;
     for (;;) {
       try {
         await this._client.waitReady(PHASE_READY, { signal });
@@ -594,6 +602,19 @@ class Announcement {
         return;
       } catch (e) {
         if (signal.aborted) return;
+        if (appNotAnswering(e)) {
+          // The app announces before it serves: nothing tells this loop
+          // when it starts answering, so core is asked again after a
+          // bounded backoff.
+          console.log(`core cannot reach the app at ${this._url} yet; asking again in ${redial} ms: ${e.message}`);
+          try {
+            await sleep(redial, signal);
+          } catch {
+            return;
+          }
+          redial = Math.min(2 * redial, REDIAL_MAX_MS);
+          continue;
+        }
         if (!notReady(e)) {
           console.error(`core refused the app at ${this._url}; it is not announced: ${e.message}`);
           return;
