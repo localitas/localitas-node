@@ -18,6 +18,19 @@ const AUTOMATION_RUN_ID_HEADER = 'Localitas-Automation-Run-ID';
 // How close to its expiry a client refreshes the identity token it acts with.
 const REFRESH_BEFORE_SECONDS = 60;
 
+// The phases of a node's lifecycle waitReady can wait for: every shard has a
+// leader; core serves its own calls (users still get 503); every route serves.
+const PHASE_RAFT_READY = 'raft_ready';
+const PHASE_SERVING = 'serving';
+const PHASE_READY = 'ready';
+
+// How long core holds one readiness question before answering that the node
+// is not there yet: under core's shortest HTTP write timeout (30 s), which
+// would cut a longer one.
+const READY_POLL_TIMEOUT_S = 25;
+const REDIAL_FIRST_MS = 100;
+const REDIAL_MAX_MS = 5000;
+
 class APIError extends Error {
   constructor(method, path, statusCode, body) {
     super(`${method} ${path}: ${statusCode} ${body}`);
@@ -241,9 +254,12 @@ class LocalitasClient {
    * Register the app listening on port with core, so core proxies to it and
    * runs its jobs. The app tells core only where it is (that port on its own
    * host); core reads the rest from its health.json,
-   * cron.json and public-paths.json. Returns at once and keeps trying in the
-   * background until core takes the app, since core reads the app while
-   * registering it. Call withdraw() on shutdown.
+   * cron.json and public-paths.json. Returns at once and, in the background,
+   * waits until core is ready (waitReady) and registers the app once, since
+   * core reads the app while registering it. A registration core answers 503
+   * (not ready: it restarted) waits again; one it answers 502 (the app does
+   * not answer yet) is asked again after a bounded backoff; any other failure
+   * is logged as an error and not tried again. Call withdraw() on shutdown.
    *
    * In a container it does nothing: core registers app containers itself
    * when Docker reports them healthy, and only core knows the port it
@@ -251,6 +267,57 @@ class LocalitasClient {
    */
   announce(port) {
     return new Announcement(this, port);
+  }
+
+  /**
+   * Wait until the node this client talks to is at phase (PHASE_READY,
+   * PHASE_SERVING or PHASE_RAFT_READY) with every hook of it finished. Asks
+   * core's readiness endpoint, a long poll core answers at the transition
+   * itself, and asks again when core answers that the node is not there
+   * yet: the poll's timeout passed, or the node drains (its next boot
+   * follows). Resolves once ready; rejects with signal's reason once signal
+   * aborts, and with any other failure, a fault no waiting mends.
+   */
+  async waitReady(phase = PHASE_READY, { signal } = {}) {
+    let redial = REDIAL_FIRST_MS;
+    for (;;) {
+      signal?.throwIfAborted();
+      let answer;
+      try {
+        answer = await this._askReady(phase, signal);
+      } catch (e) {
+        if (signal?.aborted || !coreDown(e)) throw e;
+        // Core's process is not running or not yet listening: the one case
+        // with no event to wait on, so dial again after a bounded backoff.
+        await sleep(redial, signal);
+        redial = Math.min(2 * redial, REDIAL_MAX_MS);
+        continue;
+      }
+      redial = REDIAL_FIRST_MS;
+      if (answer.ready) return;
+      // A draining node answers at once until its HTTP stops; core says when
+      // to ask again.
+      if (answer.phase === 'draining' || answer.phase === 'stopped') await sleep(answer.retryAfterMs, signal);
+    }
+  }
+
+  /** Ask core's readiness endpoint once, held up to READY_POLL_TIMEOUT_S. */
+  async _askReady(phase, signal) {
+    const path = `/api/system/ready?phase=${esc(phase)}&timeout=${READY_POLL_TIMEOUT_S}s`;
+    const resp = await fetch(this._url(path), { signal });
+    const text = await resp.text();
+    if (resp.status !== 200 && resp.status !== 503) throw new APIError('GET', path, resp.status, text);
+    let answer = null;
+    try {
+      answer = JSON.parse(text);
+    } catch {
+      answer = null;
+    }
+    if (!answer || typeof answer !== 'object' || answer.ready !== (resp.status === 200)) {
+      throw new APIError('GET', path, resp.status, `not core's readiness answer: ${text}`);
+    }
+    const retryAfter = Number(resp.headers.get('retry-after') ?? '1');
+    return { ready: answer.ready, phase: answer.phase || '', retryAfterMs: (Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : 1) * 1000 };
   }
 
   // ── Permissions ────────────────────────────────────────────
@@ -464,8 +531,35 @@ class LocalitasClient {
   }
 }
 
-const ANNOUNCE_RETRY_FIRST_MS = 1000;
-const ANNOUNCE_RETRY_MAX_MS = 30000;
+/** Whether e says core's process is not there: it refused the connection,
+ *  or dropped it without answering. */
+function coreDown(e) {
+  const code = e?.cause?.code ?? e?.code;
+  return ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(code);
+}
+
+/** Whether core could not take the app because the app did not answer it
+ *  yet (502): its port closed, or health.json not served yet. */
+function appNotAnswering(e) {
+  return e instanceof APIError && e.statusCode === 502;
+}
+
+/** Whether a call failed because core could not take it yet: it answered
+ *  503 (not ready), or its process is not there. */
+function notReady(e) {
+  if (e instanceof APIError) return e.statusCode === 503;
+  return coreDown(e);
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    timer.unref();
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function inContainer() {
   const fs = require('fs');
@@ -484,30 +578,49 @@ class Announcement {
     this._client = client;
     this._url = `http://localhost:${port}`;
     this._name = '';
-    this._stopped = false;
     this._settled = false;
-    this._wake = null;
+    this._stop = new AbortController();
     this._done = inContainer() ? Promise.resolve() : this._run();
     this._done.then(() => { this._settled = true; });
   }
 
   async _run() {
-    let wait = ANNOUNCE_RETRY_FIRST_MS;
-    while (!this._stopped) {
+    const { signal } = this._stop;
+    let redial = REDIAL_FIRST_MS;
+    for (;;) {
+      try {
+        await this._client.waitReady(PHASE_READY, { signal });
+      } catch (e) {
+        if (!signal.aborted) console.error(`waiting for core to be ready failed; the app at ${this._url} is not announced: ${e.message}`);
+        return;
+      }
+      if (signal.aborted) return;
       try {
         const app = await this._client._do('POST', '/apps/ext', { url: this._url });
         this._name = (app && app.name) || '';
         console.log(`announced ${this._name} at ${this._url}`);
         return;
       } catch (e) {
-        console.warn(`core has not taken the app at ${this._url} yet; trying again in ${wait / 1000}s: ${e.message}`);
+        if (signal.aborted) return;
+        if (appNotAnswering(e)) {
+          // The app announces before it serves: nothing tells this loop
+          // when it starts answering, so core is asked again after a
+          // bounded backoff.
+          console.log(`core cannot reach the app at ${this._url} yet; asking again in ${redial} ms: ${e.message}`);
+          try {
+            await sleep(redial, signal);
+          } catch {
+            return;
+          }
+          redial = Math.min(2 * redial, REDIAL_MAX_MS);
+          continue;
+        }
+        if (!notReady(e)) {
+          console.error(`core refused the app at ${this._url}; it is not announced: ${e.message}`);
+          return;
+        }
+        console.log(`core is not ready to take the app at ${this._url}; waiting for it: ${e.message}`);
       }
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, wait);
-        timer.unref();
-        this._wake = () => { clearTimeout(timer); resolve(); };
-      });
-      wait = Math.min(2 * wait, ANNOUNCE_RETRY_MAX_MS);
     }
   }
 
@@ -516,10 +629,11 @@ class Announcement {
     return this._settled ? this._name : '';
   }
 
-  /** Stop announcing and take the app out of core, if core had taken it. */
+  /** Stop announcing and take the app out of core, if core had taken it. A
+   *  wait for core's readiness ends at once; a registration in flight is
+   *  waited for, since only core's answer names the app it took. */
   async withdraw() {
-    this._stopped = true;
-    if (this._wake) this._wake();
+    this._stop.abort();
     await this._done;
     if (this._name) {
       await this._client._do('DELETE', `/apps/ext/${esc(this._name)}`);
@@ -1361,7 +1475,7 @@ module.exports = {
   LocalitasClient, Database, CacheRef, ListRef, SetRef, HashRef, SortedSetRef,
   QueueRef, StackRef, PubSubRef, PubSubWS, AutomationClient, APIError, Announcement, defaultToken,
   AppRef, ConfigError, cacheSocketUrl, coreUrlFromEnv,
-  AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER,
+  AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER, PHASE_RAFT_READY, PHASE_SERVING, PHASE_READY,
   ...automation,
   Migrator: migrator.Migrator,
   crypto,
