@@ -28,6 +28,9 @@ const PHASE_READY = 'ready';
 // is not there yet: under core's shortest HTTP write timeout (30 s), which
 // would cut a longer one.
 const READY_POLL_TIMEOUT_S = 25;
+// How long core holds one wait for a run before answering that it has not
+// finished, under the same write timeout.
+const RUN_WAIT_HOLD_S = 25;
 const REDIAL_FIRST_MS = 100;
 const REDIAL_MAX_MS = 5000;
 
@@ -495,11 +498,12 @@ class LocalitasClient {
 
   // ── Transport ──────────────────────────────────────────────
 
-  async _do(method, path, body = null) {
+  async _do(method, path, body = null, { signal } = {}) {
     const url = this._url(path);
     const opts = {
       method,
       headers: {},
+      signal,
     };
 
     const bearer = await this._bearer();
@@ -1154,40 +1158,38 @@ class AutomationClient {
   /**
    * Return the run once it has finished, without polling it.
    *
-   * Every finished run is announced once, after its outcome is recorded, on
-   * the channel its first read names (its owner's own completions channel;
-   * only the owner can read the run, so the caller is the owner), or on the
-   * shared 'completions' channel of a core that names none. This reads the
-   * run to learn the channel, notes the channel's last message, then reads
-   * the run again; the read is linearizable, so a run whose completion is at
-   * or before the noted message is read finished. A run still going is
-   * waited for by watching the channel after the noted message: its
-   * completion comes after it, so it cannot be missed.
+   * Asks core's wait for the run, a long poll any node answers from the
+   * committed run: at once when the run has finished, else as soon as a
+   * commit ends it, or after core's hold that it has not, when it asks
+   * again. It depends on nothing being published: a node that records the
+   * run's end and dies before telling anyone still leaves the end committed.
+   * A core that cannot answer yet (503, or its process not there) is waited
+   * for (waitReady) and asked again. A run that does not exist, or is not
+   * the caller's, rejects with core's APIError; the wait rejects with a
+   * timeout error after timeout ms.
    */
   async waitForRun(runId, { timeout = 3600000 } = {}) {
-    let run = await this.getRun(runId);
-    if (run.status === 'completed' || run.status === 'failed') return run;
-    const channel = run.completion_channel || 'completions';
-    const noted = await this._client.cache('localitas_automations').pubSub(channel).lastSeq();
-    run = await this.getRun(runId);
-    if (run.status === 'completed' || run.status === 'failed') return run;
-
-    const ps = new PubSubWS({ url: cacheSocketUrl(this._client.baseUrl, 'localitas_automations'), token: this._client.token });
-    try {
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`Timeout waiting for run ${runId}`)), timeout);
-        ps.watch(channel, noted, (msg) => {
-          let announced = {};
-          try { announced = JSON.parse(msg.value || '{}'); } catch (_) { return; }
-          if (announced.run_id === runId) {
-            clearTimeout(timer);
-            resolve();
-          }
-        });
-      });
-      return await this.getRun(runId);
-    } finally {
-      ps.close();
+    const signal = AbortSignal.timeout(timeout);
+    const deadline = Date.now() + timeout;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal.aborted) throw new Error(`Timeout waiting for run ${runId}`);
+      const holdMs = Math.min(RUN_WAIT_HOLD_S * 1000, remaining);
+      let answer;
+      try {
+        answer = await this._client._do('GET', `/apps/automation/api/runs/${esc(runId)}/wait?timeout=${holdMs}ms`, null, { signal });
+      } catch (e) {
+        if (signal.aborted) throw new Error(`Timeout waiting for run ${runId}`);
+        if (!notReady(e)) throw e;
+        try {
+          await this._client.waitReady(PHASE_READY, { signal });
+        } catch (err) {
+          if (signal.aborted) throw new Error(`Timeout waiting for run ${runId}`);
+          throw err;
+        }
+        continue;
+      }
+      if (answer && answer.finished) return answer.run;
     }
   }
 }
