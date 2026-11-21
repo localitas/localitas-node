@@ -12,6 +12,7 @@ const ALLOWED = [
   { file: 'index.js', line: 'this._url = `http://localhost:${port}`;' },
   // automation: the names an automation's url may not hold, refused before sending (ownMachine); never called.
   { file: 'automation.js', line: "const OWN_NAMES = ['localhost', 'host.docker.internal'];" },
+  { file: 'automation.js', line: "if (OWN_NAMES.includes(h) || h.endsWith('.localhost')) return true;" },
 ];
 
 describe('package source', () => {
