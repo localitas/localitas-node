@@ -4,6 +4,10 @@ const { WebSocketServer } = require('ws');
 const { describe, it, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert');
 
+// No test reaches the core of the machine running it through its core.env:
+// the home is empty.
+process.env.LOCALITAS_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'localitas-home-'));
+
 async function withEnv(values, fn) {
   const saved = {};
   for (const k of Object.keys(values)) {
