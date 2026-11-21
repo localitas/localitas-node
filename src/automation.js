@@ -15,6 +15,7 @@
  *   await client.automation().create(req);
  */
 
+const net = require('node:net');
 const { checkAppName, checkAppPath } = require('./address');
 
 const STRATEGIES = ['raft_leader', 'any_node', 'all_nodes', 'local_only'];
@@ -108,6 +109,51 @@ function appCall(app, path) {
   return new AppCall(app, path);
 }
 
+const OWN_NAMES = ['localhost', 'host.docker.internal'];
+const OWN_ADDRESSES = new net.BlockList();
+OWN_ADDRESSES.addSubnet('127.0.0.0', 8, 'ipv4');
+OWN_ADDRESSES.addAddress('0.0.0.0', 'ipv4');
+OWN_ADDRESSES.addSubnet('169.254.0.0', 16, 'ipv4');
+OWN_ADDRESSES.addAddress('::1', 'ipv6');
+OWN_ADDRESSES.addAddress('::', 'ipv6');
+OWN_ADDRESSES.addSubnet('fe80::', 10, 'ipv6');
+
+/** Whether host only ever means the machine using it: a loopback,
+ * unspecified or link-local address, its own name, or a container's host. */
+function ownMachine(host) {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (OWN_NAMES.includes(h)) return true;
+  const family = net.isIP(h);
+  return family !== 0 && OWN_ADDRESSES.check(h, family === 4 ? 'ipv4' : 'ipv6');
+}
+
+/** Accepts what core does in an http-api task's url: a core path
+ * ('/apps/...'), called on the node running the step, or an absolute http(s)
+ * URL of another machine. A URL naming the machine using it (loopback, its
+ * own name) is refused: stored in a replicated automation, it sends whichever
+ * node runs the step to itself. An app is called by name, an AppCall. A url
+ * still holding a template ({{node.field}}) in place of its scheme or host is
+ * checked by core once it is filled in. */
+function checkCallURL(raw) {
+  if (raw === undefined || (raw.startsWith('/') && !raw.startsWith('//'))) return raw;
+  let u = null;
+  try {
+    u = new URL(raw);
+  } catch {
+    u = null;
+  }
+  if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:') || !u.hostname) {
+    if (raw.includes('{{')) return raw;
+    throw new TypeError(`HTTPSettings url ${JSON.stringify(raw)} is neither a path (/apps/...) nor an http(s) URL`);
+  }
+  if (ownMachine(u.hostname)) {
+    const path = u.pathname + u.search;
+    throw new TypeError(`HTTPSettings url ${JSON.stringify(raw)} names this machine's own address, which sends whichever node runs the step to itself; `
+      + `call an app by name with an AppCall (core's AppRef: app, path ${path}, protocol http), or core by its path (${path})`);
+  }
+  return raw;
+}
+
 const HTTP_FIELDS = ['url', 'app', 'method', 'contentType', 'headers', 'body', 'timeoutMs', 'maxRetries', 'backoffMs',
   'backoffMultiplier', 'maxBackoffMs', 'expectedStatus', 'asyncTimeoutMs', 'deferrable', 'vaultCredentialId',
   'vaultAuthFormat', 'vaultHeaderName', 'vaultHeaderPrefix'];
@@ -125,7 +171,7 @@ class HTTPSettings {
       throw new TypeError('HTTPSettings headers must map names to strings');
     }
     this._wire = compact({
-      url: text('HTTPSettings url', opts.url),
+      url: checkCallURL(text('HTTPSettings url', opts.url)),
       app: instance('HTTPSettings app', opts.app, AppCall),
       method: text('HTTPSettings method', opts.method),
       content_type: text('HTTPSettings contentType', opts.contentType),

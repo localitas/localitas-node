@@ -123,6 +123,20 @@ describe('typed automation requests', () => {
     assert.ok(httpNode('a', 'raft_leader', http1(), { retryDelay: '1h30m', retries: 0 }) instanceof DAGNode);
   });
 
+  it('refuse a url naming this machine, naming an AppCall instead', () => {
+    // Core refuses each: stored in a replicated automation, it sends
+    // whichever node runs the step to itself.
+    for (const url of ['http://localhost:9204/api/sync', 'http://LOCALHOST:8090/apps/faas/fn/report',
+      'http://127.0.0.2:9204/api/sync', 'http://[::1]:8090/apps/notes/api/notes', 'http://0.0.0.0:9204/api/sync']) {
+      assert.throws(() => new HTTPSettings({ url }), /AppCall.*AppRef/, url);
+    }
+    assert.throws(() => new HTTPSettings({ url: 'ftp://a.test/b' }), TypeError);
+    for (const url of ['/apps/faas/fn/report', 'https://hooks.example.com/done', 'http://192.168.1.50:8080/hook',
+      '{{lookup.response.url}}']) {
+      assert.deepStrictEqual(new HTTPSettings({ url }).toJSON(), { url }, url);
+    }
+  });
+
   it('create posts the request and returns the automation', async () => {
     let got;
     const server = http.createServer((req, res) => {

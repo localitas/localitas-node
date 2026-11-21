@@ -33,7 +33,7 @@ async function withSlowRun(fn) {
     description: 'node sdk wait test',
     dag_config: { dag_id: name, name, description: '', nodes: [{
       node_id: 'slow', node_type: 'http-api', execution_strategy: 'any_node',
-      metadata: { url: `${INTEG_URL}/api/system/no_such_route_${name}`, method: 'GET', timeout_ms: 5000, max_retries: 3, backoff_ms: 30000, max_backoff_ms: 30000 },
+      metadata: { url: `/api/system/no_such_route_${name}`, method: 'GET', timeout_ms: 5000, max_retries: 3, backoff_ms: 30000, max_backoff_ms: 30000 },
     }] },
     trigger_type: 'manual',
     trigger_config: {},
