@@ -46,7 +46,7 @@ class Statement {
 /**
  * A database on core, used like better-sqlite3 but async. Get one by name
  * with client.db(name); new Database(id, { host, token }) takes host from
- * the argument, else CORE_URL, and never guesses one.
+ * the argument, else CORE_URL (or the home's core.env), and never guesses one.
  */
 class Database {
   constructor(dbId, opts = {}) {

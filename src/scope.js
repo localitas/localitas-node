@@ -45,10 +45,11 @@ function resetIdentityPublicKeys() {
   publicKeys = null;
 }
 
-/** Ask core (CORE_URL, with LOCALITAS_API_TOKEN) for its identity public key.
- *  An app running on the host, without LOCALITAS_IDENTITY_PUBLIC_KEY, awaits
- *  this once at startup. Without CORE_URL it asks nothing and rejects with a
- *  ConfigError, as it rejects when core is unreachable. */
+/** Ask core (CORE_URL, else the home's core.env, with LOCALITAS_API_TOKEN)
+ *  for its identity public key. An app running on the host, without
+ *  LOCALITAS_IDENTITY_PUBLIC_KEY, awaits this once at startup. Without a core
+ *  URL it asks nothing and rejects with a ConfigError, as it rejects when
+ *  core is unreachable. */
 async function loadIdentityPublicKey() {
   const { defaultToken, coreUrlFromEnv } = require('./index');
   const base = coreUrlFromEnv();

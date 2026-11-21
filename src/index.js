@@ -52,12 +52,61 @@ class ConfigError extends Error {
   }
 }
 
-const CORE_URL_UNSET = 'CORE_URL is not set: core sets it for every app it runs; outside core pass the URL to the constructor';
+// How a process learns where core is and which token it acts with: core
+// gives an app it starts (a container, a FaaS function) CORE_URL and
+// LOCALITAS_API_TOKEN, and writes the same variables, with its loopback URL,
+// to core.env in its home for the other processes of its machine (an app
+// launchd runs, a tool). Each is read from the environment first, from the
+// home's file second; the Go and Python SDKs read them the same way.
+const CORE_URL_VAR = 'CORE_URL';
+const TOKEN_VAR = 'LOCALITAS_API_TOKEN';
+const HOME_VAR = 'LOCALITAS_HOME';
+const CORE_ENV_FILE = 'core.env';
 
-/** CORE_URL without trailing slashes; a ConfigError when unset or not an absolute http(s) URL. */
+const CORE_URL_UNSET = 'CORE_URL is not set: core sets it for every app it starts and writes it to core.env in its home ($LOCALITAS_HOME, else ~/.localitas) for the other processes of its machine; outside core pass the URL to the constructor';
+
+/** The home of the core this process belongs to: $LOCALITAS_HOME, else ~/.localitas. */
+function coreHome() {
+  return process.env[HOME_VAR] || require('path').join(require('os').homedir(), '.localitas');
+}
+
+/** { url, token, source, file }: each variable from the environment when
+ *  set, else from the home's core.env; source is where the URL came from. */
+function coreSettings() {
+  let url = (process.env[CORE_URL_VAR] || '').trim();
+  let token = (process.env[TOKEN_VAR] || '').trim();
+  const file = require('path').join(coreHome(), CORE_ENV_FILE);
+  let source = 'environment';
+  if (!url || !token) {
+    let content = '';
+    try {
+      content = require('fs').readFileSync(file, 'utf8');
+    } catch (_) {
+      content = '';
+    }
+    for (const raw of content.split('\n')) {
+      const line = raw.trim();
+      const eq = line.indexOf('=');
+      if (!line || line.startsWith('#') || eq < 0) continue;
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim();
+      if (key === CORE_URL_VAR && !url) {
+        url = value;
+        source = file;
+      } else if (key === TOKEN_VAR && !token) {
+        token = value;
+      }
+    }
+  }
+  return { url, token, source, file };
+}
+
+/** Core's base URL without trailing slashes: CORE_URL, else the one in the
+ *  home's core.env; a ConfigError naming the variable and the file when
+ *  there is none or it is not an absolute http(s) URL. */
 function coreUrlFromEnv() {
-  const raw = (process.env.CORE_URL || '').trim();
-  if (!raw) throw new ConfigError(CORE_URL_UNSET);
+  const { url: raw, source, file } = coreSettings();
+  if (!raw) throw new ConfigError(`${CORE_URL_UNSET} (${file} has none)`);
   let parsed = null;
   try {
     parsed = new URL(raw);
@@ -65,7 +114,7 @@ function coreUrlFromEnv() {
     parsed = null;
   }
   if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.host) {
-    throw new ConfigError(`CORE_URL ${JSON.stringify(raw)} is not an absolute http(s) URL`);
+    throw new ConfigError(`CORE_URL ${JSON.stringify(raw)} (from the ${source}) is not an absolute http(s) URL`);
   }
   return raw.replace(/\/+$/, '');
 }
@@ -87,12 +136,15 @@ class LocalitasClient {
     this.now = () => Date.now() / 1000;
   }
 
-  /** The client of an app core runs: core at CORE_URL, acting with
-   *  LOCALITAS_API_TOKEN. Throws a ConfigError naming whichever is missing. */
+  /** The client of an app: core's URL (CORE_URL) and the app's token
+   *  (LOCALITAS_API_TOKEN), each from the environment core gives an app it
+   *  starts, else from the core.env core writes in its home for the other
+   *  processes of its machine. Throws a ConfigError naming the variable and
+   *  the file when one is missing or malformed. */
   static default() {
     const baseUrl = coreUrlFromEnv();
-    const token = process.env.LOCALITAS_API_TOKEN || '';
-    if (!token) throw new ConfigError('LOCALITAS_API_TOKEN is not set: core sets it for every app it runs; outside core pass the token to the constructor');
+    const { token, file } = coreSettings();
+    if (!token) throw new ConfigError(`LOCALITAS_API_TOKEN is not set: core sets it for every app it starts and writes it to ${file} for the other processes of its machine; outside core pass the token to the constructor`);
     return new LocalitasClient(baseUrl, token);
   }
 
@@ -688,29 +740,11 @@ function isMiss(e) {
 }
 
 /**
- * Deprecated: use LocalitasClient.default(). The API token from
- * LOCALITAS_API_TOKEN, else ~/.localitas/config-core.yaml
- * (core.auth.api_token); '' if neither has one.
+ * The API token LocalitasClient.default() uses: LOCALITAS_API_TOKEN, else
+ * the one in the home's core.env; '' if neither has one.
  */
 function defaultToken() {
-  if (process.env.LOCALITAS_API_TOKEN) return process.env.LOCALITAS_API_TOKEN;
-  const fs = require('fs');
-  const path = require('path');
-  const home = require('os').homedir();
-  const configPath = path.join(home, '.localitas', 'config-core.yaml');
-
-  try {
-    const content = fs.readFileSync(configPath, 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('api_token:')) {
-        const val = trimmed.slice('api_token:'.length).trim().replace(/^["']|["']$/g, '');
-        if (val.startsWith('lt_')) return val;
-      }
-    }
-  } catch (_) {}
-
-  return '';
+  return coreSettings().token;
 }
 
 /**
