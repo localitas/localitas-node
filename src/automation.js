@@ -119,10 +119,11 @@ OWN_ADDRESSES.addAddress('::', 'ipv6');
 OWN_ADDRESSES.addSubnet('fe80::', 10, 'ipv6');
 
 /** Whether host only ever means the machine using it: a loopback,
- * unspecified or link-local address, its own name, or a container's host. */
+ * unspecified or link-local address, its own name or any name under it
+ * (RFC 6761), or a container's host. */
 function ownMachine(host) {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
-  if (OWN_NAMES.includes(h)) return true;
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (OWN_NAMES.includes(h) || h.endsWith('.localhost')) return true;
   const family = net.isIP(h);
   return family !== 0 && OWN_ADDRESSES.check(h, family === 4 ? 'ipv4' : 'ipv6');
 }
